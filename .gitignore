@@ -1,0 +1,34 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+
+# Local databases/runtime data
+*.sqlite3
+*.db
+data/*.sqlite3
+data/*.db
+data/agent_outputs_latest.json
+
+# Python caches/build
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+dist/
+build/
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+
+# Test/coverage artifacts
+.coverage
+htmlcov/
+
+# OS/editor
+.DS_Store
+.vscode/
