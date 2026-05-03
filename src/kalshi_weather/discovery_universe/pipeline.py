@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,8 @@ from kalshi_weather.discovery_universe.scoring import (
 )
 from kalshi_weather.kalshi.client import KalshiClient
 
+_NUMERIC_TOKEN_PAT = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
 
 @dataclass(slots=True)
 class DiscoveryOptions:
@@ -37,11 +40,78 @@ class DiscoveryOptions:
     safe_min_score: float = 55.0
 
 
-def _markets_from_event(event: dict[str, Any]) -> list[dict[str, Any]]:
-    mk = event.get("markets")
-    if isinstance(mk, list):
-        return [m for m in mk if isinstance(m, dict)]
+def _extract_event_markets(event: dict[str, Any]) -> list[dict[str, Any]]:
+    # Kalshi can represent nested market contracts under different payload keys.
+    for key in ("markets", "nested_markets", "contracts", "options"):
+        mk = event.get(key)
+        if isinstance(mk, list):
+            return [m for m in mk if isinstance(m, dict)]
     return []
+
+
+def _is_numeric_option(market: dict[str, Any]) -> bool:
+    numeric_fields = (
+        "strike",
+        "strike_price",
+        "floor_strike",
+        "ceiling_strike",
+        "threshold",
+        "min_value",
+        "max_value",
+        "range_min",
+        "range_max",
+    )
+    for key in numeric_fields:
+        if market.get(key) is not None:
+            return True
+    blob = " ".join(
+        str(market.get(k) or "")
+        for k in (
+            "title",
+            "yes_sub_title",
+            "no_sub_title",
+            "subtitle",
+            "rules_primary",
+            "rules_secondary",
+        )
+    )
+    return bool(_NUMERIC_TOKEN_PAT.search(blob))
+
+
+def _market_option_kind(market: dict[str, Any]) -> str:
+    mtype = str(market.get("market_type") or "").strip().lower()
+    if mtype in {"binary", "yes_no", "yesno"}:
+        return "binary_yes_no"
+    if mtype in {"scalar", "range", "numeric"}:
+        return "numeric_option"
+    if _is_numeric_option(market):
+        return "numeric_option"
+    return "categorical_option"
+
+
+def _market_option_label(market: dict[str, Any]) -> str:
+    for key in ("title", "yes_sub_title", "subtitle"):
+        val = market.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return str(market.get("ticker") or market.get("market_ticker") or "").strip()
+
+
+def _normalize_event_market_bundle(event: dict[str, Any], markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    et_raw = event.get("event_ticker") or event.get("ticker")
+    et = str(et_raw).strip() if et_raw is not None else ""
+    total = len(markets)
+    out: list[dict[str, Any]] = []
+    for idx, market in enumerate(markets):
+        m = dict(market)
+        if et and not m.get("event_ticker"):
+            m["event_ticker"] = et
+        m["event_market_count"] = total
+        m["market_index_in_event"] = idx
+        m["market_option_kind"] = _market_option_kind(m)
+        m["market_option_label"] = _market_option_label(m)
+        out.append(m)
+    return out
 
 
 def _cached_metadata(
@@ -78,9 +148,9 @@ def _ensure_markets_for_event(
     client: KalshiClient,
     event: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    mk = _markets_from_event(event)
+    mk = _extract_event_markets(event)
     if mk:
-        return mk
+        return _normalize_event_market_bundle(event, mk)
     et = event.get("event_ticker") or event.get("ticker")
     if not isinstance(et, str) or not et:
         return []
@@ -89,7 +159,8 @@ def _ensure_markets_for_event(
     except Exception:
         return []
     out = data.get("markets") or []
-    return [m for m in out if isinstance(m, dict)]
+    rows = [m for m in out if isinstance(m, dict)]
+    return _normalize_event_market_bundle(event, rows)
 
 
 def run_discovery(
@@ -216,6 +287,21 @@ def run_discovery(
                 metadata=meta,
                 hours_to_close=hours_to_close_from_market(m),
                 milestone_ids=mids,
+                event_market_count=(
+                    int(m.get("event_market_count"))
+                    if m.get("event_market_count") is not None
+                    else None
+                ),
+                market_option_kind=(
+                    str(m.get("market_option_kind"))
+                    if m.get("market_option_kind") is not None
+                    else None
+                ),
+                market_option_label=(
+                    str(m.get("market_option_label"))
+                    if m.get("market_option_label") is not None
+                    else None
+                ),
             )
         )
 

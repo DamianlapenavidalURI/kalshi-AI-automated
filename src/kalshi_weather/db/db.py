@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,6 +23,10 @@ _M7_PROPOSAL_SIGNAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("proposals", "feature_summary_json", "TEXT"),
     ("proposals", "candidate_quality_bucket", "TEXT"),
 )
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 _M4_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("proposal_pipeline_runs", "run_summary_json", "TEXT"),
@@ -88,6 +93,46 @@ def _ensure_watchlist_filter_audit_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_state_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS market_state (
+          ticker TEXT PRIMARY KEY,
+          event_ticker TEXT,
+          family TEXT,
+          last_decision TEXT,
+          last_decision_time TEXT,
+          last_reasoning TEXT,
+          last_forecast_snapshot_json TEXT,
+          last_price_seen REAL,
+          open_position_side TEXT,
+          open_position_size REAL,
+          open_position_entry_price REAL,
+          pnl_estimate REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_market_state_event_family
+          ON market_state(event_ticker, family);
+
+        CREATE TABLE IF NOT EXISTS thesis_state (
+          thesis_key TEXT PRIMARY KEY,
+          ticker TEXT NOT NULL,
+          event_ticker TEXT,
+          family TEXT,
+          last_bet_time TEXT,
+          last_decision_time TEXT,
+          repeat_count INTEGER NOT NULL DEFAULT 0,
+          last_reasoning TEXT,
+          last_evidence_hash TEXT,
+          last_forecast_snapshot_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_thesis_state_ticker
+          ON thesis_state(ticker, last_decision_time);
+        """
+    )
+
+
 def _migrate_m6_monitor_horizon_columns(conn: sqlite3.Connection) -> None:
     for table, col, sql_type in _M6_MONITOR_COLUMNS:
         if table != _M6_MONITOR_TABLE:
@@ -102,6 +147,81 @@ def _migrate_m6_monitor_horizon_columns(conn: sqlite3.Connection) -> None:
         if col in cols:
             continue
         conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {sql_type}')
+
+
+def _migrate_execution_orders_table(conn: sqlite3.Connection) -> None:
+    demo_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='demo_orders'"
+    ).fetchone()
+    execution_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='execution_orders'"
+    ).fetchone()
+
+    if demo_exists and not execution_exists:
+        conn.execute("ALTER TABLE demo_orders RENAME TO execution_orders")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_execution_orders_market_status
+              ON execution_orders(market_ticker, order_status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_execution_orders_proposal
+              ON execution_orders(proposal_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_execution_orders_execution_run
+              ON execution_orders(execution_run_id)
+            """
+        )
+        return
+
+    if demo_exists and execution_exists:
+        exec_count = int(conn.execute("SELECT COUNT(*) FROM execution_orders").fetchone()[0])
+        demo_count = int(conn.execute("SELECT COUNT(*) FROM demo_orders").fetchone()[0])
+        if exec_count == 0 and demo_count > 0:
+            conn.execute("DROP TABLE execution_orders")
+            conn.execute("ALTER TABLE demo_orders RENAME TO execution_orders")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_execution_orders_market_status
+                  ON execution_orders(market_ticker, order_status)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_execution_orders_proposal
+                  ON execution_orders(proposal_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_execution_orders_execution_run
+                  ON execution_orders(execution_run_id)
+                """
+            )
+            return
+
+        if exec_count > 0 and demo_count > 0:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO execution_orders(
+                  id, created_at, updated_at, execution_run_id, proposal_id, market_ticker,
+                  event_ticker, side, action, dry_run, client_order_id, kalshi_order_id, order_status,
+                  request_json, response_json, block_reason
+                )
+                SELECT
+                  id, created_at, updated_at, execution_run_id, proposal_id, market_ticker,
+                  event_ticker, side, action, dry_run, client_order_id, kalshi_order_id, order_status,
+                  request_json, response_json, block_reason
+                FROM demo_orders
+                """
+            )
+            conn.execute("PRAGMA foreign_keys = ON")
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +241,205 @@ class Db:
             _migrate_m6_monitor_horizon_columns(conn)
             _migrate_m7_proposal_signal_columns(conn)
             _ensure_watchlist_filter_audit_table(conn)
+            _ensure_state_tables(conn)
+            _migrate_execution_orders_table(conn)
             conn.commit()
+
+    def get_market_state(self, *, ticker: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ticker, event_ticker, family, last_decision, last_decision_time, last_reasoning,
+                       last_forecast_snapshot_json, last_price_seen, open_position_side, open_position_size,
+                       open_position_entry_price, pnl_estimate
+                FROM market_state
+                WHERE ticker = ?
+                """,
+                (ticker,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        raw = out.get("last_forecast_snapshot_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                out["last_forecast_snapshot_json"] = json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+        return out
+
+    def get_thesis_state(self, *, thesis_key: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT thesis_key, ticker, event_ticker, family, last_bet_time, last_decision_time,
+                       repeat_count, last_reasoning, last_evidence_hash, last_forecast_snapshot_json
+                FROM thesis_state
+                WHERE thesis_key = ?
+                """,
+                (thesis_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        raw = out.get("last_forecast_snapshot_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                out["last_forecast_snapshot_json"] = json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+        return out
+
+    def upsert_market_state(
+        self,
+        *,
+        ticker: str,
+        event_ticker: str | None,
+        family: str | None,
+        last_decision: str | None = None,
+        last_decision_time: str | None = None,
+        last_reasoning: str | None = None,
+        last_forecast_snapshot: dict[str, Any] | None = None,
+        last_price_seen: float | None = None,
+        open_position_side: str | None = None,
+        open_position_size: float | None = None,
+        open_position_entry_price: float | None = None,
+        pnl_estimate: float | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO market_state(
+                  ticker, event_ticker, family, last_decision, last_decision_time, last_reasoning,
+                  last_forecast_snapshot_json, last_price_seen, open_position_side, open_position_size,
+                  open_position_entry_price, pnl_estimate
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                  event_ticker=excluded.event_ticker,
+                  family=excluded.family,
+                  last_decision=COALESCE(excluded.last_decision, market_state.last_decision),
+                  last_decision_time=COALESCE(excluded.last_decision_time, market_state.last_decision_time),
+                  last_reasoning=COALESCE(excluded.last_reasoning, market_state.last_reasoning),
+                  last_forecast_snapshot_json=COALESCE(excluded.last_forecast_snapshot_json, market_state.last_forecast_snapshot_json),
+                  last_price_seen=COALESCE(excluded.last_price_seen, market_state.last_price_seen),
+                  open_position_side=COALESCE(excluded.open_position_side, market_state.open_position_side),
+                  open_position_size=COALESCE(excluded.open_position_size, market_state.open_position_size),
+                  open_position_entry_price=COALESCE(excluded.open_position_entry_price, market_state.open_position_entry_price),
+                  pnl_estimate=COALESCE(excluded.pnl_estimate, market_state.pnl_estimate)
+                """,
+                (
+                    ticker,
+                    event_ticker,
+                    family,
+                    last_decision,
+                    last_decision_time or _utc_now_iso(),
+                    last_reasoning,
+                    json.dumps(last_forecast_snapshot, ensure_ascii=False)
+                    if isinstance(last_forecast_snapshot, dict)
+                    else None,
+                    last_price_seen,
+                    open_position_side,
+                    open_position_size,
+                    open_position_entry_price,
+                    pnl_estimate,
+                ),
+            )
+            conn.commit()
+
+    def upsert_thesis_state(
+        self,
+        *,
+        thesis_key: str,
+        ticker: str,
+        event_ticker: str | None,
+        family: str | None,
+        decision: str,
+        reasoning: str | None,
+        evidence_hash: str | None,
+        forecast_snapshot: dict[str, Any] | None = None,
+        bet_placed: bool = False,
+    ) -> dict[str, Any]:
+        now_iso = _utc_now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT repeat_count, last_evidence_hash
+                FROM thesis_state
+                WHERE thesis_key = ?
+                """,
+                (thesis_key,),
+            ).fetchone()
+            prev_repeat = int(row["repeat_count"]) if row and row["repeat_count"] is not None else 0
+            prev_hash = str(row["last_evidence_hash"] or "") if row else ""
+            no_novelty = bool(evidence_hash) and bool(prev_hash) and evidence_hash == prev_hash
+            repeat_count = (prev_repeat + 1) if no_novelty else 0
+            conn.execute(
+                """
+                INSERT INTO thesis_state(
+                  thesis_key, ticker, event_ticker, family, last_bet_time, last_decision_time,
+                  repeat_count, last_reasoning, last_evidence_hash, last_forecast_snapshot_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thesis_key) DO UPDATE SET
+                  ticker=excluded.ticker,
+                  event_ticker=excluded.event_ticker,
+                  family=excluded.family,
+                  last_bet_time=COALESCE(excluded.last_bet_time, thesis_state.last_bet_time),
+                  last_decision_time=excluded.last_decision_time,
+                  repeat_count=excluded.repeat_count,
+                  last_reasoning=COALESCE(excluded.last_reasoning, thesis_state.last_reasoning),
+                  last_evidence_hash=COALESCE(excluded.last_evidence_hash, thesis_state.last_evidence_hash),
+                  last_forecast_snapshot_json=COALESCE(excluded.last_forecast_snapshot_json, thesis_state.last_forecast_snapshot_json)
+                """,
+                (
+                    thesis_key,
+                    ticker,
+                    event_ticker,
+                    family,
+                    now_iso if bet_placed else None,
+                    now_iso,
+                    repeat_count,
+                    reasoning,
+                    evidence_hash,
+                    json.dumps(forecast_snapshot, ensure_ascii=False)
+                    if isinstance(forecast_snapshot, dict)
+                    else None,
+                ),
+            )
+            conn.commit()
+        return {"repeat_count": repeat_count, "no_novelty": no_novelty, "last_evidence_hash": prev_hash}
+
+    def recent_market_decisions(
+        self,
+        *,
+        ticker: str | None = None,
+        event_ticker: str | None = None,
+        family: str | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        args: list[Any] = []
+        if ticker:
+            where.append("ticker = ?")
+            args.append(ticker)
+        if event_ticker:
+            where.append("event_ticker = ?")
+            args.append(event_ticker)
+        if family:
+            where.append("family = ?")
+            args.append(family)
+        sql = """
+            SELECT ticker, event_ticker, family, last_decision, last_decision_time, last_reasoning
+            FROM market_state
+        """
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY last_decision_time DESC LIMIT ?"
+        args.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        return [dict(r) for r in rows]
 
     def insert_run(self, *, run_id: str, status: str, meta: dict[str, Any] | None = None) -> None:
         with self.connect() as conn:
@@ -585,13 +903,13 @@ class Db:
                 WHERE p.guard_outcome = 'approved'
                   AND datetime(p.created_at) >= datetime('now', ?)
                   AND NOT EXISTS (
-                    SELECT 1 FROM demo_orders d
+                    SELECT 1 FROM execution_orders d
                     WHERE d.proposal_id = p.proposal_id
                       AND d.dry_run = 0
                       AND d.order_status IN ('resting', 'executed')
                   )
                   AND NOT EXISTS (
-                    SELECT 1 FROM demo_orders d
+                    SELECT 1 FROM execution_orders d
                     WHERE d.market_ticker = p.market_ticker
                       AND d.dry_run = 0
                       AND d.order_status = 'resting'
@@ -608,7 +926,7 @@ class Db:
     ) -> bool:
         cur = conn.execute(
             """
-            SELECT 1 FROM demo_orders
+            SELECT 1 FROM execution_orders
             WHERE market_ticker = ?
               AND dry_run = 0
               AND order_status = 'resting'
@@ -637,7 +955,7 @@ class Db:
     ) -> None:
         conn.execute(
             """
-            INSERT INTO demo_orders(
+            INSERT INTO execution_orders(
               execution_run_id, proposal_id, market_ticker, event_ticker, side, action,
               dry_run, client_order_id, kalshi_order_id, order_status,
               request_json, response_json, block_reason
@@ -670,7 +988,7 @@ class Db:
     ) -> None:
         conn.execute(
             """
-            UPDATE demo_orders
+            UPDATE execution_orders
             SET order_status = ?, response_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             WHERE id = ?
             """,
@@ -682,7 +1000,7 @@ class Db:
             cur = conn.execute(
                 """
                 SELECT id, kalshi_order_id, order_status
-                FROM demo_orders
+                FROM execution_orders
                 WHERE dry_run = 0
                   AND kalshi_order_id IS NOT NULL
                   AND order_status NOT IN ('executed', 'canceled', 'submit_failed', 'skipped_blocked', 'dry_run')
@@ -700,7 +1018,7 @@ class Db:
                 SELECT id, created_at, updated_at, execution_run_id, proposal_id, market_ticker,
                        event_ticker, side, dry_run, client_order_id, kalshi_order_id, order_status,
                        block_reason
-                FROM demo_orders
+                FROM execution_orders
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
@@ -710,15 +1028,15 @@ class Db:
 
     def demo_orders_summary(self) -> dict[str, Any]:
         with self.connect() as conn:
-            total = int(conn.execute("SELECT COUNT(*) FROM demo_orders").fetchone()[0])
+            total = int(conn.execute("SELECT COUNT(*) FROM execution_orders").fetchone()[0])
             dry = int(
-                conn.execute("SELECT COUNT(*) FROM demo_orders WHERE dry_run = 1").fetchone()[0]
+                conn.execute("SELECT COUNT(*) FROM execution_orders WHERE dry_run = 1").fetchone()[0]
             )
             real = total - dry
             by_st = conn.execute(
                 """
                 SELECT order_status, COUNT(*) AS n
-                FROM demo_orders
+                FROM execution_orders
                 GROUP BY order_status
                 ORDER BY n DESC
                 """

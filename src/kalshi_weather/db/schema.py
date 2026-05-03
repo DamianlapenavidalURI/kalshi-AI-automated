@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS orders (
   FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 
-CREATE TABLE IF NOT EXISTS demo_orders (
+CREATE TABLE IF NOT EXISTS execution_orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -224,14 +224,14 @@ CREATE TABLE IF NOT EXISTS demo_orders (
   FOREIGN KEY(proposal_id) REFERENCES proposals(proposal_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_demo_orders_market_status
-  ON demo_orders(market_ticker, order_status);
+CREATE INDEX IF NOT EXISTS idx_execution_orders_market_status
+  ON execution_orders(market_ticker, order_status);
 
-CREATE INDEX IF NOT EXISTS idx_demo_orders_proposal
-  ON demo_orders(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_execution_orders_proposal
+  ON execution_orders(proposal_id);
 
-CREATE INDEX IF NOT EXISTS idx_demo_orders_execution_run
-  ON demo_orders(execution_run_id);
+CREATE INDEX IF NOT EXISTS idx_execution_orders_execution_run
+  ON execution_orders(execution_run_id);
 
 CREATE TABLE IF NOT EXISTS rt_ws_sessions (
   session_id TEXT PRIMARY KEY,
@@ -312,5 +312,39 @@ CREATE TABLE IF NOT EXISTS rt_tickers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rt_tickers_session ON rt_tickers(session_id, received_at);
+
+CREATE TABLE IF NOT EXISTS market_state (
+  ticker TEXT PRIMARY KEY,
+  event_ticker TEXT,
+  family TEXT,
+  last_decision TEXT,
+  last_decision_time TEXT,
+  last_reasoning TEXT,
+  last_forecast_snapshot_json TEXT,
+  last_price_seen REAL,
+  open_position_side TEXT,
+  open_position_size REAL,
+  open_position_entry_price REAL,
+  pnl_estimate REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_state_event_family
+  ON market_state(event_ticker, family);
+
+CREATE TABLE IF NOT EXISTS thesis_state (
+  thesis_key TEXT PRIMARY KEY,
+  ticker TEXT NOT NULL,
+  event_ticker TEXT,
+  family TEXT,
+  last_bet_time TEXT,
+  last_decision_time TEXT,
+  repeat_count INTEGER NOT NULL DEFAULT 0,
+  last_reasoning TEXT,
+  last_evidence_hash TEXT,
+  last_forecast_snapshot_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_thesis_state_ticker
+  ON thesis_state(ticker, last_decision_time);
 """
 

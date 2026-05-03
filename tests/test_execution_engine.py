@@ -15,6 +15,11 @@ def _market(ticker: str, *, category: str = "Sports", event: str = "EVT-1") -> d
         "ticker": ticker,
         "category": category,
         "event_ticker": event,
+        "status": "active",
+        "yes_bid_size_fp": "5",
+        "yes_ask_size_fp": "5",
+        "no_bid_size_fp": "5",
+        "no_ask_size_fp": "5",
         "title": "NBA game",
         "rules_primary": "yes if team wins",
     }
@@ -151,6 +156,113 @@ def test_live_batch_fallback_to_single() -> None:
     assert all(r.status == "submitted" for r in out.results)
 
 
+def test_live_single_submit_4xx_is_exchange_rejected() -> None:
+    client = KalshiClient(base_url="https://demo-api.kalshi.co/trade-api/v2", auth=None)
+    eng = KalshiExecutionEngine(
+        client,
+        config=ExecutionEngineConfig(
+            mode="live",
+            prefer_batch=False,
+            risk=RiskLimits(per_market_max_contracts=100.0, rolling_matched_contracts_15s=None),
+            use_order_groups_for_rolling=False,
+        ),
+    )
+
+    def fake_request(inst: KalshiClient, method: str, path: str, **kwargs: object) -> dict:
+        if method == "POST" and path == "/portfolio/orders":
+            raise KalshiHttpError(
+                "bad request",
+                status_code=400,
+                response_text='{"error":"market is not open"}',
+            )
+        return {}
+
+    with patch.object(KalshiClient, "request", fake_request):
+        out = eng.execute_batch(
+            [
+                OrderIntent(
+                    ticker="M-1",
+                    side="yes",
+                    action="buy",
+                    count_fp="1.00",
+                    policy="taker_ioc",
+                    limit_price_dollars="0.60",
+                )
+            ],
+            portfolio={"market_positions": [], "event_positions": []},
+            markets_by_ticker={"M-1": _market("M-1")},
+            orderbooks_by_ticker={"M-1": _ob()},
+            recent_fills=[],
+            now_ts=time.time(),
+        )
+
+    assert out.results[0].status == "exchange_rejected"
+    assert out.results[0].reasons == ["market_not_open"]
+    assert out.results[0].error is None
+
+
+def test_live_single_retry_on_ioc_4xx_price_then_submit() -> None:
+    client = KalshiClient(base_url="https://demo-api.kalshi.co/trade-api/v2", auth=None)
+    eng = KalshiExecutionEngine(
+        client,
+        config=ExecutionEngineConfig(
+            mode="live",
+            prefer_batch=False,
+            risk=RiskLimits(per_market_max_contracts=100.0, rolling_matched_contracts_15s=None),
+            use_order_groups_for_rolling=False,
+        ),
+    )
+    calls: list[tuple[str, str, dict]] = []
+
+    def fake_request(inst: KalshiClient, method: str, path: str, **kwargs: object) -> dict:
+        body = kwargs.get("json")
+        calls.append((method, path, body if isinstance(body, dict) else {}))
+        if method == "POST" and path == "/portfolio/orders":
+            if len([c for c in calls if c[0] == "POST" and c[1] == "/portfolio/orders"]) == 1:
+                raise KalshiHttpError(
+                    "bad request",
+                    status_code=400,
+                    response_text='{"message":"invalid price"}',
+                )
+            return {
+                "order": {
+                    "order_id": "o2",
+                    "client_order_id": (body or {}).get("client_order_id"),
+                    "ticker": (body or {}).get("ticker"),
+                }
+            }
+        if method == "GET" and path.startswith("/markets/"):
+            return {"market": {"yes_ask_dollars": "0.1700", "no_ask_dollars": "0.8300"}}
+        return {}
+
+    with patch.object(KalshiClient, "request", fake_request):
+        out = eng.execute_batch(
+            [
+                OrderIntent(
+                    ticker="M-1",
+                    side="yes",
+                    action="buy",
+                    count_fp="1.00",
+                    policy="taker_ioc",
+                    limit_price_dollars="0.15",
+                )
+            ],
+            portfolio={"market_positions": [], "event_positions": []},
+            markets_by_ticker={"M-1": _market("M-1")},
+            orderbooks_by_ticker={"M-1": _ob()},
+            recent_fills=[],
+            now_ts=time.time(),
+        )
+
+    posts = [c for c in calls if c[0] == "POST" and c[1] == "/portfolio/orders"]
+    assert len(posts) == 2
+    # Retry should switch from IOC to GTC and refresh limit.
+    assert posts[1][2].get("time_in_force") == "good_till_canceled"
+    assert posts[1][2].get("post_only") is False
+    assert posts[1][2].get("yes_price_dollars") == "0.1700"
+    assert out.results[0].status == "submitted"
+
+
 def test_risk_per_market() -> None:
     client = KalshiClient(base_url="https://demo-api.kalshi.co/trade-api/v2", auth=None)
     eng = KalshiExecutionEngine(
@@ -276,11 +388,11 @@ def test_batch_category_running_total() -> None:
     assert "per_category_max_exposure" in out.results[1].reasons
 
 
-def test_shadow_mode_is_read_only() -> None:
+def test_dry_run_mode_is_read_only() -> None:
     client = KalshiClient(base_url="https://demo-api.kalshi.co/trade-api/v2", auth=None)
     eng = KalshiExecutionEngine(
         client,
-        config=ExecutionEngineConfig(mode="shadow", risk=RiskLimits(per_market_max_contracts=50.0)),
+        config=ExecutionEngineConfig(mode="dry_run", risk=RiskLimits(per_market_max_contracts=50.0)),
     )
     with patch.object(KalshiClient, "request") as m:
         out = eng.execute_batch(
@@ -301,5 +413,5 @@ def test_shadow_mode_is_read_only() -> None:
             now_ts=time.time(),
         )
     m.assert_not_called()
-    assert out.mode == "shadow"
+    assert out.mode == "dry_run"
     assert out.results[0].status == "skipped_read_only"

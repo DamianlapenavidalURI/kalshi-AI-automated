@@ -1,5 +1,9 @@
 from __future__ import annotations
-from kalshi_weather.system.orchestrator import UnifiedWeatherOrchestratorConfig, run_unified_weather_cycle
+from kalshi_weather.system.orchestrator import (
+    UnifiedWeatherOrchestratorConfig,
+    run_unified_weather_cycle,
+    run_unified_weather_risk_watch,
+)
 from kalshi_weather.kalshi.client import KalshiClient
 from kalshi_weather.kalshi.auth import KalshiAuth
 from kalshi_weather.config import get_settings
@@ -36,10 +40,27 @@ def main() -> None:
     )
     p.add_argument("--run", choices=("once", "loop"),
                    default=settings.unified_run)
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help="Alias for --run once (kept for runtime compatibility).",
+    )
     p.add_argument("--poll-seconds", type=int,
-                   default=settings.unified_poll_seconds)
-    p.add_argument("--mode", choices=("dry_run", "shadow",
-                   "live"), default=settings.unified_mode)
+                   default=settings.unified_full_cycle_seconds,
+                   help="Legacy alias for full cycle cadence in loop mode.")
+    p.add_argument(
+        "--full-cycle-seconds",
+        type=int,
+        default=None,
+        help="Heavy full-cycle cadence (discovery + deep research + entry planning).",
+    )
+    p.add_argument(
+        "--risk-watcher-seconds",
+        type=int,
+        default=settings.unified_risk_watcher_seconds,
+        help="Lightweight risk watcher cadence for open positions and rolling risk checks.",
+    )
+    p.add_argument("--mode", choices=("dry_run", "live"), default=settings.unified_mode)
     p.add_argument("--horizon-days", type=int,
                    default=settings.unified_horizon_days)
     p.add_argument("--limit-candidates", type=int,
@@ -92,7 +113,7 @@ def main() -> None:
         help="Print full agent output JSON to stdout after each cycle.",
     )
     args = p.parse_args()
-    run_mode = str(args.run)
+    run_mode = "once" if bool(args.once) else str(args.run)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -106,7 +127,11 @@ def main() -> None:
     logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
     client = _build_client()
     cfg = UnifiedWeatherOrchestratorConfig(
-        model=settings.openai_model,
+        model_scout=settings.openai_model_scout,
+        model_context=settings.openai_model_context,
+        model_edge=settings.openai_model_edge,
+        model_critique=settings.openai_model_critique,
+        model_final=settings.openai_model_final,
         kalshi_env=settings.kalshi_env,
         mode=args.mode,
         horizon_days=args.horizon_days,
@@ -118,6 +143,7 @@ def main() -> None:
         deep_search_timeout_s=max(2.0, float(args.deep_search_timeout_s)),
         min_liquidity_contracts=max(0.0, float(args.min_liquidity_contracts)),
         repeat_market_cooldown_minutes=max(1, int(args.repeat_market_cooldown_minutes)),
+        repeat_thesis_cooldown_minutes=max(1, int(settings.unified_repeat_thesis_cooldown_minutes)),
         final_orchestrator_temperature=max(0.0, min(1.0, float(args.final_orchestrator_temperature))),
         candidate_scan_multiplier=max(1, int(args.candidate_scan_multiplier)),
         scout_override_priority_0_100=float(args.scout_override_priority),
@@ -127,6 +153,7 @@ def main() -> None:
         restricted_to_live_bets=settings.unified_restricted_to_live_bets,
         restricted_to_weather_family=settings.unified_restricted_to_weather_family,
         selection_policy_notes=settings.unified_selection_policy_notes,
+        db_path=settings.db_path,
     )
     logging.info(
         "[CONFIG] kalshi_env=%s base_url=%s mode=%s autonomy=%s top_n_deep_search=%s weather_series_tag=%s",
@@ -136,6 +163,14 @@ def main() -> None:
         cfg.autonomy_profile,
         cfg.top_n_deep_search,
         cfg.weather_series_tag or "(off)",
+    )
+    logging.info(
+        "[CONFIG][MODELS] scout=%s context=%s edge=%s critique=%s final=%s",
+        cfg.model_scout,
+        cfg.model_context,
+        cfg.model_edge,
+        cfg.model_critique,
+        cfg.model_final,
     )
 
     def _fmt_top(counter: dict[str, int], k: int = 5) -> str:
@@ -169,11 +204,19 @@ def main() -> None:
             cfg.data_fetch_workers,
             entry.get("intents_attempted", 0),
             entry.get("submitted", 0),
-            entry.get("risk_rejected", 0),
+            entry.get("rejected", entry.get("risk_rejected", 0)),
             entry.get("errors", 0),
             portfolio.get("open_positions_seen", 0),
             float(portfolio.get("total_abs_exposure_dollars", 0.0) or 0.0),
         )
+        outcomes = entry.get("execution_outcomes")
+        if isinstance(outcomes, list):
+            problem_outcomes = [
+                o for o in outcomes
+                if isinstance(o, dict) and str(o.get("status") or "") in {"error", "exchange_rejected"}
+            ]
+            if problem_outcomes:
+                logging.info("[ENTRY][EXECUTION] outcomes=%s", json.dumps(problem_outcomes[:5], ensure_ascii=False))
         logging.info("[AGENTS] wrote full outputs to %s", output_path)
         timing = out.get("stage_timing_s") if isinstance(
             out.get("stage_timing_s"), dict) else {}
@@ -205,16 +248,54 @@ def main() -> None:
         run_once()
         return
 
-    logging.info(
-        "[RUNNER] loop mode enabled poll_seconds=%s",
-        max(10, int(args.poll_seconds)),
+    full_cycle_seconds = max(
+        30,
+        int(args.full_cycle_seconds if args.full_cycle_seconds is not None else args.poll_seconds),
     )
+    risk_watcher_seconds = max(5, int(args.risk_watcher_seconds))
+    logging.info(
+        "[RUNNER] loop mode enabled full_cycle_seconds=%s risk_watcher_seconds=%s",
+        full_cycle_seconds,
+        risk_watcher_seconds,
+    )
+    next_full_run_ts = 0.0
+    next_risk_watch_ts = 0.0
     while True:
-        try:
-            run_once()
-        except Exception as e:
-            logging.exception("unified weather cycle failed: %s", e)
-        time.sleep(max(10, int(args.poll_seconds)))
+        now_ts = time.time()
+        did_work = False
+
+        if now_ts >= next_risk_watch_ts:
+            did_work = True
+            risk_started = time.time()
+            try:
+                risk_out = run_unified_weather_risk_watch(client, cfg=cfg)
+                logging.info(
+                    "[RISK-WATCH] open_positions=%s checked_markets=%s alerts=%s rolling_15s=%.2f/%.2f elapsed=%.2fs",
+                    risk_out.get("open_positions_count", 0),
+                    risk_out.get("checked_markets", 0),
+                    risk_out.get("alerts_count", 0),
+                    float(risk_out.get("rolling_15s_matched_contracts", 0.0) or 0.0),
+                    float(risk_out.get("rolling_15s_limit", 0.0) or 0.0),
+                    max(0.0, time.time() - risk_started),
+                )
+                alerts = risk_out.get("alerts")
+                if isinstance(alerts, list) and alerts:
+                    logging.info("[RISK-WATCH][ALERTS] %s", json.dumps(alerts[:5], ensure_ascii=False))
+            except Exception as e:
+                logging.exception("risk watcher cycle failed: %s", e)
+            next_risk_watch_ts = now_ts + risk_watcher_seconds
+
+        if now_ts >= next_full_run_ts:
+            did_work = True
+            try:
+                run_once()
+            except Exception as e:
+                logging.exception("unified weather cycle failed: %s", e)
+            next_full_run_ts = now_ts + full_cycle_seconds
+
+        if not did_work:
+            sleep_s = max(1.0, min(next_full_run_ts, next_risk_watch_ts) - time.time())
+            time.sleep(sleep_s)
 
 
 if __name__ == "__main__":

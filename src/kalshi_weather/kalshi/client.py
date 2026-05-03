@@ -74,6 +74,8 @@ class KalshiClient:
             if query:
                 url = f"{url}?{query}"
         headers: dict[str, str] = {"Accept": "application/json"}
+        if json is not None:
+            headers["Content-Type"] = "application/json"
 
         if require_auth and not self.auth:
             raise ValueError("This request requires auth but no KalshiAuth is configured.")

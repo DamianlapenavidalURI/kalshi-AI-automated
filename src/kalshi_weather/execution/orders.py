@@ -3,7 +3,13 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from kalshi_weather.execution.preflight import _parse_float
+def _parse_float(s: Any) -> float | None:
+    if s is None:
+        return None
+    try:
+        return float(str(s))
+    except ValueError:
+        return None
 
 
 def new_client_order_id() -> str:

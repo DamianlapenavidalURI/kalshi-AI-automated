@@ -55,6 +55,9 @@ class RankedCandidate:
     metadata: dict[str, Any] | None
     hours_to_close: float | None
     milestone_ids: list[str] = field(default_factory=list)
+    event_market_count: int | None = None
+    market_option_kind: str | None = None
+    market_option_label: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +74,9 @@ class RankedCandidate:
             "score_explanation": self.explanation.to_dict(),
             "hours_to_close": self.hours_to_close,
             "milestone_ids": self.milestone_ids,
+            "event_market_count": self.event_market_count,
+            "market_option_kind": self.market_option_kind,
+            "market_option_label": self.market_option_label,
             "market": self.market,
             "event": self.event,
             "metadata": self.metadata,

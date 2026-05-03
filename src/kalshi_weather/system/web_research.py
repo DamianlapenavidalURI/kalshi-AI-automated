@@ -1,24 +1,45 @@
 from __future__ import annotations
 
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from dataclasses import asdict
+from datetime import datetime, timezone
 import re
 from typing import Any, Callable
 
-import requests
-
-from kalshi_weather.system.contracts import CandidateContext
+from kalshi_weather.config import get_settings
+from kalshi_weather.system.contracts import (
+    CandidateContext,
+    EvidenceBundle,
+    compute_evidence_hash,
+    make_thesis_key,
+)
+from kalshi_weather.tools.news_search import duckduckgo_search
+from kalshi_weather.tools.nhc import current_storms
+from kalshi_weather.tools.nws import alerts_brief, forecast_brief
+from kalshi_weather.tools.open_meteo import geocode_open_meteo, history_brief
+from kalshi_weather.tools.openweather import get_openweather_client
+from kalshi_weather.tools.usgs import all_day_quakes
 
 _VS_SPLIT = re.compile(r"\b(vs\.?|versus|v\.?|@)\b", re.I)
 _SPACE = re.compile(r"\s+")
 _DATE_YYYY_MM_DD = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 _CITY_STATE = re.compile(r"\b([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2})\b")
 _STATE_ONLY = re.compile(r"\b([A-Z]{2})\b")
-_HEADERS = {
-    "User-Agent": "kalshi-weather-research/2.0 (local demo project)",
-    "Accept": "application/geo+json,application/json,text/plain,*/*",
+_AIRPORT_HINTS: dict[str, tuple[str, str]] = {
+    "SFO": ("San Francisco, CA", "CA"),
+    "NYC": ("New York, NY", "NY"),
+    "CHI": ("Chicago, IL", "IL"),
+    "DEN": ("Denver, CO", "CO"),
+    "ATL": ("Atlanta, GA", "GA"),
+    "AUS": ("Austin, TX", "TX"),
+    "PHIL": ("Philadelphia, PA", "PA"),
+    "NOLA": ("New Orleans, LA", "LA"),
+    "HOU": ("Houston, TX", "TX"),
+    "MIA": ("Miami, FL", "FL"),
+    "BOS": ("Boston, MA", "MA"),
+    "SEA": ("Seattle, WA", "WA"),
+    "LAX": ("Los Angeles, CA", "CA"),
 }
 _SOURCE_WEIGHTS = {
     "open_meteo_geocode": 1.0,
@@ -29,31 +50,108 @@ _SOURCE_WEIGHTS = {
     "nhc_storms": 0.95,
     "usgs_quakes": 0.95,
 }
-_CACHE_LOCK = threading.Lock()
-_CACHE: dict[str, tuple[float, Any]] = {}
-
-
-def _cache_get(key: str, ttl_s: float) -> Any | None:
-    now = time.time()
-    with _CACHE_LOCK:
-        row = _CACHE.get(key)
-    if row is None:
-        return None
-    ts, value = row
-    if now - ts > ttl_s:
-        with _CACHE_LOCK:
-            _CACHE.pop(key, None)
-        return None
-    return value
-
-
-def _cache_set(key: str, value: Any) -> None:
-    with _CACHE_LOCK:
-        _CACHE[key] = (time.time(), value)
+_THRESHOLD_PAT = re.compile(r"\b(?:above|over|exceed|greater than|below|under|less than)\s+(-?\d+(?:\.\d+)?)")
+_ANY_NUMBER_PAT = re.compile(r"(-?\d+(?:\.\d+)?)")
 
 
 def _clean_entity(s: str) -> str:
     return _SPACE.sub(" ", s.strip(" -,:;|"))
+
+
+def _f(x: Any) -> float | None:
+    try:
+        if x is None:
+            return None
+        return float(str(x).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_threshold_from_title(title: str) -> float | None:
+    m = _THRESHOLD_PAT.search(title.lower())
+    if m:
+        return _f(m.group(1))
+    m2 = _ANY_NUMBER_PAT.search(title)
+    if m2:
+        return _f(m2.group(1))
+    return None
+
+
+def _model_probability_from_delta(delta: float) -> float:
+    # Bounded, deterministic mapping from forecast-threshold delta to confidence-like probability.
+    score = 0.5 + max(-0.49, min(0.49, delta / 20.0))
+    return max(0.01, min(0.99, score))
+
+
+def _build_evidence_bundle(
+    *,
+    market_family: str,
+    market_ticker: str,
+    market_title: str,
+    event_ticker: str,
+    close_time: str,
+    yes_bid: float | None,
+    yes_ask: float | None,
+    source_status: list[dict[str, Any]],
+    freshness_meta: dict[str, Any],
+    openweather: dict[str, Any] | None,
+) -> EvidenceBundle:
+    implied = None
+    if yes_bid is not None and yes_ask is not None:
+        implied = max(0.0, min(1.0, (yes_bid + yes_ask) / 2.0))
+    threshold = _parse_threshold_from_title(market_title)
+    forecast_value: float | None = None
+    if isinstance(openweather, dict):
+        if market_family == "hourly_temperature":
+            hourly = openweather.get("hourly") if isinstance(openweather.get("hourly"), list) else []
+            if hourly and isinstance(hourly[0], dict):
+                forecast_value = _f(hourly[0].get("temp"))
+        elif market_family == "snow_and_rain":
+            daily = openweather.get("daily") if isinstance(openweather.get("daily"), list) else []
+            if daily and isinstance(daily[0], dict):
+                rain = _f(daily[0].get("rain")) or 0.0
+                snow = _f(daily[0].get("snow")) or 0.0
+                forecast_value = rain + snow
+        else:
+            daily = openweather.get("daily") if isinstance(openweather.get("daily"), list) else []
+            if daily and isinstance(daily[0], dict):
+                forecast_value = _f(daily[0].get("temp_max")) or _f(daily[0].get("temp_min"))
+    model_probability = None
+    if forecast_value is not None and threshold is not None:
+        model_probability = _model_probability_from_delta(forecast_value - threshold)
+    edge = None
+    if model_probability is not None and implied is not None:
+        edge = model_probability - implied
+    confidence = max(0.0, min(1.0, float((freshness_meta or {}).get("source_ok_ratio", 0.0) or 0.0)))
+    uncertainty = max(0.0, min(1.0, 1.0 - confidence))
+    thesis_key = make_thesis_key(
+        market_ticker=market_ticker,
+        family=market_family,
+        threshold=threshold,
+        side_hint="yes",
+    )
+    bundle = EvidenceBundle(
+        market_ticker=market_ticker,
+        family=market_family,
+        market_title=market_title,
+        event_ticker=event_ticker,
+        close_time=close_time,
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        implied_probability=implied,
+        forecast_value=forecast_value,
+        threshold=threshold,
+        model_probability=model_probability,
+        edge=edge,
+        confidence=confidence,
+        uncertainty=uncertainty,
+        agreement_score=confidence,
+        sources=source_status,
+        data_freshness_seconds=_f((freshness_meta or {}).get("data_freshness_seconds")),
+        thesis_key=thesis_key,
+    )
+    bundle.evidence_hash = compute_evidence_hash(bundle)
+    return bundle
 
 
 def _best_effort_event_day(*, event_title: str, market_title: str, close_time: str | None) -> str | None:
@@ -70,17 +168,51 @@ def _best_effort_event_day(*, event_title: str, market_title: str, close_time: s
     return None
 
 
-def _location_guess(*, event_title: str, market_title: str) -> tuple[str | None, str | None]:
+def _ticker_location_hints(*, market_ticker: str, event_ticker: str) -> tuple[str | None, str | None, list[str]]:
+    stems = []
+    for raw in (event_ticker, market_ticker):
+        token = str(raw or "").split("-")[0].strip().upper()
+        if token:
+            stems.append(token)
+    candidates: list[str] = []
+    for stem in stems:
+        alpha = re.sub(r"[^A-Z]", "", stem)
+        if len(alpha) >= 3:
+            candidates.append(alpha[-3:])
+        if len(alpha) >= 4:
+            candidates.append(alpha[-4:])
+    candidates = [c for c in dict.fromkeys(candidates) if c]
+    for c in candidates:
+        if c in _AIRPORT_HINTS:
+            city, st = _AIRPORT_HINTS[c]
+            return city, st, [city, c]
+    return None, None, candidates
+
+
+def _location_guess(
+    *,
+    event_title: str,
+    market_title: str,
+    market_ticker: str = "",
+    event_ticker: str = "",
+) -> tuple[str | None, str | None, list[str]]:
     joined = " | ".join(x for x in (event_title, market_title) if x)
     cm = _CITY_STATE.search(joined)
     if cm:
         city = cm.group(1).strip()
         state = cm.group(2).strip()
-        return f"{city}, {state}", state
+        return f"{city}, {state}", state, [f"{city}, {state}"]
     sm = _STATE_ONLY.search(joined)
     if sm:
-        return None, sm.group(1).strip()
-    return None, None
+        state = sm.group(1).strip()
+        hint_city, _, hint_queries = _ticker_location_hints(
+            market_ticker=market_ticker, event_ticker=event_ticker
+        )
+        return hint_city, state, ([hint_city] if hint_city else []) + hint_queries
+    hint_city, hint_state, hint_queries = _ticker_location_hints(
+        market_ticker=market_ticker, event_ticker=event_ticker
+    )
+    return hint_city, hint_state, hint_queries
 
 
 def extract_entities(*, event_title: str, market_title: str, max_entities: int = 4) -> list[str]:
@@ -100,13 +232,6 @@ def extract_entities(*, event_title: str, market_title: str, max_entities: int =
             continue
         candidates.append(item)
     return list(dict.fromkeys(candidates))[:max_entities]
-
-
-def _http_get_json(url: str, *, params: dict[str, Any] | None = None, timeout_s: float = 8.0) -> dict[str, Any]:
-    r = requests.get(url, params=params, timeout=timeout_s, headers=_HEADERS)
-    r.raise_for_status()
-    payload = r.json()
-    return payload if isinstance(payload, dict) else {}
 
 
 def _timed_source(
@@ -132,210 +257,32 @@ def _timed_source(
         }
 
 
-def _cached_request(
-    *,
-    source: str,
-    key: str,
-    ttl_s: float,
-    loader: Callable[[], dict[str, Any]],
-) -> dict[str, Any]:
-    hit = _cache_get(key, ttl_s=ttl_s)
-    if isinstance(hit, dict):
-        out = dict(hit)
-        out["_from_cache"] = True
-        return out
-    payload = loader()
-    if isinstance(payload, dict):
-        _cache_set(key, payload)
-    return payload
-
-
 def _geocode_open_meteo(query: str, timeout_s: float = 8.0) -> dict[str, Any]:
-    def _load() -> dict[str, Any]:
-        d = _http_get_json(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": query, "count": 1, "language": "en", "format": "json"},
-            timeout_s=timeout_s,
-        )
-        rows = d.get("results")
-        if not isinstance(rows, list) or not rows:
-            return {"ok": False, "error": "no_geocode_result", "query": query}
-        row = rows[0] if isinstance(rows[0], dict) else {}
-        lat = row.get("latitude")
-        lon = row.get("longitude")
-        if lat is None or lon is None:
-            return {"ok": False, "error": "missing_lat_lon", "query": query}
-        return {
-            "ok": True,
-            "query": query,
-            "name": row.get("name"),
-            "admin1": row.get("admin1"),
-            "country": row.get("country"),
-            "latitude": float(lat),
-            "longitude": float(lon),
-        }
-
-    return _cached_request(
-        source="open_meteo_geocode",
-        key=f"geocode::{query.lower()}",
-        ttl_s=3600,
-        loader=_load,
-    )
+    return geocode_open_meteo(query, timeout_s=timeout_s)
 
 
 def _nws_brief(*, lat: float, lon: float, timeout_s: float = 8.0) -> dict[str, Any]:
-    def _load() -> dict[str, Any]:
-        points = _http_get_json(f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}", timeout_s=timeout_s)
-        props = points.get("properties")
-        if not isinstance(props, dict):
-            return {"ok": False, "error": "nws_missing_properties"}
-        forecast_hourly_url = props.get("forecastHourly")
-        if not isinstance(forecast_hourly_url, str) or not forecast_hourly_url.strip():
-            return {"ok": False, "error": "nws_missing_forecast_hourly"}
-        hourly = _http_get_json(forecast_hourly_url, timeout_s=timeout_s)
-        hprops = hourly.get("properties")
-        periods = hprops.get("periods") if isinstance(hprops, dict) else None
-        out_periods: list[dict[str, Any]] = []
-        if isinstance(periods, list):
-            for p in periods[:10]:
-                if not isinstance(p, dict):
-                    continue
-                out_periods.append(
-                    {
-                        "startTime": p.get("startTime"),
-                        "temperature": p.get("temperature"),
-                        "temperatureUnit": p.get("temperatureUnit"),
-                        "windSpeed": p.get("windSpeed"),
-                        "shortForecast": p.get("shortForecast"),
-                        "probabilityOfPrecipitation": (
-                            p.get("probabilityOfPrecipitation", {}).get("value")
-                            if isinstance(p.get("probabilityOfPrecipitation"), dict)
-                            else None
-                        ),
-                    }
-                )
-        return {
-            "ok": True,
-            "grid_id": props.get("gridId"),
-            "grid_x": props.get("gridX"),
-            "grid_y": props.get("gridY"),
-            "forecast_periods": out_periods,
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-    return _cached_request(
-        source="nws_forecast",
-        key=f"nws::{lat:.4f}::{lon:.4f}",
-        ttl_s=900,
-        loader=_load,
-    )
+    return forecast_brief(lat=lat, lon=lon, timeout_s=timeout_s)
 
 
 def _open_meteo_history_brief(*, lat: float, lon: float, event_day: str | None, timeout_s: float = 8.0) -> dict[str, Any]:
-    if event_day:
-        try:
-            end = datetime.fromisoformat(event_day).date() - timedelta(days=1)
-        except ValueError:
-            end = datetime.now(timezone.utc).date() - timedelta(days=1)
-    else:
-        end = datetime.now(timezone.utc).date() - timedelta(days=1)
-    start = end - timedelta(days=6)
-
-    def _load() -> dict[str, Any]:
-        d = _http_get_json(
-            "https://archive-api.open-meteo.com/v1/archive",
-            params={
-                "latitude": f"{lat:.4f}",
-                "longitude": f"{lon:.4f}",
-                "start_date": start.isoformat(),
-                "end_date": end.isoformat(),
-                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
-                "timezone": "UTC",
-            },
-            timeout_s=timeout_s,
-        )
-        daily = d.get("daily")
-        if not isinstance(daily, dict):
-            return {"ok": False, "error": "open_meteo_missing_daily"}
-        dates = daily.get("time") if isinstance(daily.get("time"), list) else []
-        maxes = daily.get("temperature_2m_max") if isinstance(daily.get("temperature_2m_max"), list) else []
-        mins = daily.get("temperature_2m_min") if isinstance(daily.get("temperature_2m_min"), list) else []
-        precip = daily.get("precipitation_sum") if isinstance(daily.get("precipitation_sum"), list) else []
-        n = min(len(dates), len(maxes), len(mins), len(precip))
-        rows: list[dict[str, Any]] = []
-        for i in range(n):
-            rows.append(
-                {
-                    "date": dates[i],
-                    "temp_max_c": maxes[i],
-                    "temp_min_c": mins[i],
-                    "precip_mm": precip[i],
-                }
-            )
-        return {"ok": True, "window_start": start.isoformat(), "window_end": end.isoformat(), "daily_rows": rows}
-
-    return _cached_request(
-        source="open_meteo_history",
-        key=f"history::{lat:.4f}::{lon:.4f}::{event_day or 'none'}",
-        ttl_s=21600,
-        loader=_load,
-    )
+    return history_brief(lat=lat, lon=lon, event_day=event_day, timeout_s=timeout_s)
 
 
 def _nws_alerts_brief(*, state_code: str | None, timeout_s: float = 8.0) -> dict[str, Any]:
-    if not state_code:
-        return {"ok": False, "error": "state_code_unavailable"}
-
-    def _load() -> dict[str, Any]:
-        alert_doc = _http_get_json(
-            "https://api.weather.gov/alerts/active",
-            params={"area": state_code.upper()},
-            timeout_s=timeout_s,
-        )
-        features = alert_doc.get("features")
-        count = len(features) if isinstance(features, list) else 0
-        return {"ok": True, "state": state_code.upper(), "active_alert_count": count}
-
-    return _cached_request(
-        source="nws_alerts",
-        key=f"alerts::{state_code.upper()}",
-        ttl_s=300,
-        loader=_load,
-    )
+    return alerts_brief(state_code=state_code, timeout_s=timeout_s)
 
 
 def _duckduckgo_search(query: str, timeout_s: float = 8.0) -> dict[str, Any]:
-    return _cached_request(
-        source="duckduckgo_news",
-        key=f"ddg::{query.lower()}",
-        ttl_s=900,
-        loader=lambda: _http_get_json(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_redirect": 1, "no_html": 1, "skip_disambig": 1},
-            timeout_s=timeout_s,
-        ),
-    )
+    return duckduckgo_search(query, timeout_s=timeout_s)
 
 
 def _nhc_storms_brief(timeout_s: float = 8.0) -> dict[str, Any]:
-    return _cached_request(
-        source="nhc_storms",
-        key="nhc::current_storms",
-        ttl_s=600,
-        loader=lambda: _http_get_json("https://www.nhc.noaa.gov/CurrentStorms.json", timeout_s=timeout_s),
-    )
+    return current_storms(timeout_s=timeout_s)
 
 
 def _usgs_quake_brief(timeout_s: float = 8.0) -> dict[str, Any]:
-    return _cached_request(
-        source="usgs_quakes",
-        key="usgs::all_day",
-        ttl_s=600,
-        loader=lambda: _http_get_json(
-            "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson",
-            timeout_s=timeout_s,
-        ),
-    )
+    return all_day_quakes(timeout_s=timeout_s)
 
 
 def _entity_news(entities: list[str], *, timeout_s: float) -> list[dict[str, Any]]:
@@ -387,17 +334,29 @@ def _weather_core(
     *,
     event_title: str,
     market_title: str,
+    market_ticker: str = "",
+    event_ticker: str = "",
     close_time: str | None,
     timeout_s: float,
 ) -> dict[str, Any]:
     event_day = _best_effort_event_day(event_title=event_title, market_title=market_title, close_time=close_time)
-    location_text, state_code = _location_guess(event_title=event_title, market_title=market_title)
-    geocode_query = location_text or event_title or market_title
-
-    geocode, geocode_status = _timed_source(
-        "open_meteo_geocode",
-        lambda: _geocode_open_meteo(geocode_query, timeout_s=timeout_s),
+    location_text, state_code, location_hints = _location_guess(
+        event_title=event_title,
+        market_title=market_title,
+        market_ticker=market_ticker,
+        event_ticker=event_ticker,
     )
+    geocode_queries = [q for q in [location_text, event_title, market_title, *location_hints] if q]
+    geocode: dict[str, Any] = {"ok": False, "error": "no_query"}
+    geocode_status: dict[str, Any] = {"source": "open_meteo_geocode", "ok": False, "error": "no_query"}
+    for geocode_query in geocode_queries:
+        geocode, geocode_status = _timed_source(
+            "open_meteo_geocode",
+            lambda q=geocode_query: _geocode_open_meteo(q, timeout_s=timeout_s),
+        )
+        geocode_status["query"] = geocode_query
+        if bool(geocode.get("ok")):
+            break
     if bool(geocode.get("ok")):
         nws, nws_status = _timed_source(
             "nws_forecast",
@@ -428,6 +387,7 @@ def _weather_core(
     return {
         "event_day": event_day,
         "location_guess": location_text,
+        "location_hints": location_hints,
         "state_code": state_code,
         "geocode": geocode,
         "nws": nws,
@@ -479,6 +439,48 @@ def _family_specific_sources(
     return extras, statuses
 
 
+def _openweather_family_fetch(
+    *,
+    market_family: str,
+    geocode: dict[str, Any],
+    timeout_s: float,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if market_family not in {"daily_temperature", "hourly_temperature", "snow_and_rain"}:
+        return {}, None
+    if not bool(geocode.get("ok")):
+        return {}, {"source": "openweather", "ok": False, "error": "geocode_required"}
+    settings = get_settings(load_dotenv_file=False)
+    if not settings.openweather_api_key:
+        return {}, {"source": "openweather", "ok": False, "error": "openweather_api_key_missing"}
+    lat = _f(geocode.get("latitude"))
+    lon = _f(geocode.get("longitude"))
+    if lat is None or lon is None:
+        return {}, {"source": "openweather", "ok": False, "error": "missing_lat_lon"}
+    t0 = time.perf_counter()
+    try:
+        ow_client = get_openweather_client(
+            api_key=settings.openweather_api_key,
+            ttl_seconds=settings.openweather_ttl_seconds,
+            timeout_seconds=timeout_s,
+        )
+        payload = ow_client.fetch_weather(lat=lat, lon=lon, units="imperial")
+        status = {
+            "source": "openweather",
+            "ok": True,
+            "latency_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+            "from_cache": bool(payload.get("from_cache")),
+            "fetched_at": payload.get("fetched_at"),
+        }
+        return payload, status
+    except Exception as e:  # pragma: no cover - network best-effort
+        return {}, {
+            "source": "openweather",
+            "ok": False,
+            "latency_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+            "error": str(e),
+        }
+
+
 def _evidence_quality(source_status: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     total = len(source_status)
     ok_rows = [r for r in source_status if bool(r.get("ok"))]
@@ -498,9 +500,14 @@ def _evidence_quality(source_status: list[dict[str, Any]]) -> tuple[dict[str, An
         "source_ok_ratio": (ok / total) if total > 0 else 0.0,
         "score_0_100": round(weighted_ratio * 100.0, 2),
     }
+    latencies = [float(r.get("latency_ms") or 0.0) for r in source_status if bool(r.get("ok"))]
+    avg_latency_ms = (sum(latencies) / len(latencies)) if latencies else None
     freshness = {
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "sources_with_cache_hits": sum(1 for r in source_status if bool(r.get("from_cache"))),
+        "source_ok_ratio": quality["source_ok_ratio"],
+        "avg_source_latency_ms": avg_latency_ms,
+        "data_freshness_seconds": 0.0,
     }
     reliability = {str(r.get("source") or ""): float(_SOURCE_WEIGHTS.get(str(r.get("source") or ""), 0.5)) for r in source_status}
     return quality, freshness, reliability
@@ -511,13 +518,19 @@ def build_market_research_brief(
     market_family: str,
     event_title: str,
     market_title: str,
+    market_ticker: str = "",
+    event_ticker: str = "",
     close_time: str | None = None,
+    yes_bid: float | None = None,
+    yes_ask: float | None = None,
     deep_search: bool = False,
     timeout_s: float = 8.0,
 ) -> dict[str, Any]:
     core = _weather_core(
         event_title=event_title,
         market_title=market_title,
+        market_ticker=market_ticker,
+        event_ticker=event_ticker,
         close_time=close_time,
         timeout_s=timeout_s,
     )
@@ -529,7 +542,26 @@ def build_market_research_brief(
         deep_search=deep_search,
     )
     source_status = list(core.get("source_status") or []) + extra_statuses
+    openweather_payload, openweather_status = _openweather_family_fetch(
+        market_family=market_family,
+        geocode=core.get("geocode") if isinstance(core.get("geocode"), dict) else {},
+        timeout_s=timeout_s,
+    )
+    if isinstance(openweather_status, dict):
+        source_status.append(openweather_status)
     quality, freshness, reliability = _evidence_quality(source_status)
+    bundle = _build_evidence_bundle(
+        market_family=market_family,
+        market_ticker=market_ticker,
+        market_title=market_title,
+        event_ticker=event_ticker,
+        close_time=close_time or "",
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        source_status=source_status,
+        freshness_meta=freshness,
+        openweather=openweather_payload,
+    )
     return {
         "market_family": market_family,
         "deep_search": deep_search,
@@ -542,10 +574,12 @@ def build_market_research_brief(
         "nws": core.get("nws") or {},
         "nws_alerts": core.get("nws_alerts") or {},
         "historical_weather": core.get("historical_weather") or {},
+        "openweather": openweather_payload,
         "source_status": source_status,
         "source_reliability": reliability,
         "freshness_meta": freshness,
         "evidence_quality": quality,
+        "evidence_bundle": asdict(bundle),
         "family_extras": extras,
     }
 
@@ -597,7 +631,11 @@ def enrich_candidates_with_research(
                 market_family=c.market_family,
                 event_title=event_title,
                 market_title=market_title,
+                market_ticker=c.market_ticker,
+                event_ticker=str(c.market.get("event_ticker") or c.event.get("event_ticker") or ""),
                 close_time=str(c.market.get("close_time") or ""),
+                yes_bid=_f(c.market.get("yes_bid_dollars")),
+                yes_ask=_f(c.market.get("yes_ask_dollars")),
                 deep_search=deep,
                 timeout_s=timeout_s,
             ): c.market_ticker
@@ -624,6 +662,8 @@ def enrich_candidates_with_research(
     enriched: list[CandidateContext] = []
     for c in candidates:
         row, quality, fresh, reliab = updates.get(c.market_ticker, ({}, {}, {}, {}))
+        bundle_payload = row.get("evidence_bundle") if isinstance(row, dict) else None
+        bundle = EvidenceBundle(**bundle_payload) if isinstance(bundle_payload, dict) else c.evidence_bundle
         enriched.append(
             CandidateContext(
                 market_ticker=c.market_ticker,
@@ -637,6 +677,11 @@ def enrich_candidates_with_research(
                 freshness_meta=fresh or c.freshness_meta,
                 source_reliability=reliab,
                 deterministic_inputs=c.deterministic_inputs,
+                evidence_bundle=bundle,
+                market_state=c.market_state,
+                thesis_state=c.thesis_state,
+                recent_decisions=c.recent_decisions,
+                exposure_context=c.exposure_context,
             )
         )
     return enriched

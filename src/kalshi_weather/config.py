@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
+import warnings
 
 from dotenv import load_dotenv
 import os
@@ -17,20 +18,17 @@ class Settings:
     kalshi_private_key_path: Path | None
     db_path: Path
     openai_model: str
-    # Milestone 7: deterministic signals (aligned with risk guard spread cap)
-    risk_max_yes_spread: float
-    signal_lookback_hours: float
-    signal_max_snapshots_per_market: int
-    signal_min_snapshots: int
-    signal_stale_seconds: float
-    signal_max_mid_volatility: float
-    signal_max_single_tick_jump: float
-    min_signal_score_pipeline: float
-    min_signal_score_execution: float
-    min_signal_score_guard: float
-    signal_n_window: int
-    unified_mode: Literal["dry_run", "shadow", "live"]
+    openai_model_scout: str
+    openai_model_context: str
+    openai_model_edge: str
+    openai_model_critique: str
+    openai_model_final: str
+    openweather_api_key: str | None
+    openweather_ttl_seconds: int
+    unified_mode: Literal["dry_run", "live"]
     unified_poll_seconds: int
+    unified_full_cycle_seconds: int
+    unified_risk_watcher_seconds: int
     unified_horizon_days: int
     unified_limit_candidates: int
     unified_max_entry_orders: int
@@ -40,6 +38,7 @@ class Settings:
     unified_deep_search_timeout_s: float
     unified_min_liquidity_contracts: float
     unified_repeat_market_cooldown_minutes: int
+    unified_repeat_thesis_cooldown_minutes: int
     unified_final_orchestrator_temperature: float
     unified_candidate_scan_multiplier: int
     unified_scout_override_priority: float
@@ -111,14 +110,16 @@ def get_settings(*, load_dotenv_file: bool = True) -> Settings:
     db_path_raw = _optional_str("DB_PATH") or "./data/kalshi_weather.sqlite3"
     db_path = Path(db_path_raw).expanduser()
 
-    risk_spread = float(_optional_str("RISK_MAX_YES_SPREAD") or "0.22")
-    min_sig_pipe = float(_optional_str("MIN_SIGNAL_SCORE") or "38")
-    min_sig_exec = float(_optional_str("MIN_SIGNAL_SCORE_EXECUTION") or str(min_sig_pipe))
-    min_sig_guard = float(_optional_str("MIN_SIGNAL_SCORE_GUARD") or str(min_sig_pipe))
     unified_mode_raw = (_optional_str("UNIFIED_MODE") or "dry_run").lower()
-    if unified_mode_raw not in ("dry_run", "shadow", "live"):
-        raise ValueError(f"UNIFIED_MODE must be one of dry_run|shadow|live. Got: {unified_mode_raw!r}")
-    unified_mode = cast(Literal["dry_run", "shadow", "live"], unified_mode_raw)
+    if unified_mode_raw == "shadow":
+        warnings.warn(
+            "UNIFIED_MODE=shadow is deprecated and now maps to dry_run. Use UNIFIED_MODE=dry_run.",
+            stacklevel=2,
+        )
+        unified_mode_raw = "dry_run"
+    if unified_mode_raw not in ("dry_run", "live"):
+        raise ValueError(f"UNIFIED_MODE must be one of dry_run|live. Got: {unified_mode_raw!r}")
+    unified_mode = cast(Literal["dry_run", "live"], unified_mode_raw)
     unified_run_raw = (_optional_str("UNIFIED_RUN") or "once").lower()
     if unified_run_raw not in ("once", "loop"):
         raise ValueError(f"UNIFIED_RUN must be 'once' or 'loop'. Got: {unified_run_raw!r}")
@@ -129,25 +130,39 @@ def get_settings(*, load_dotenv_file: bool = True) -> Settings:
             f"UNIFIED_AUTONOMY_PROFILE must be one of safe|balanced|high. Got: {autonomy_profile_raw!r}"
         )
     autonomy_profile = cast(Literal["safe", "balanced", "high"], autonomy_profile_raw)
+    openai_model_env = _optional_str("OPENAI_MODEL")
+    openai_model_default = openai_model_env or "gpt-4o-mini"
+    openai_model_scout = _optional_str("OPENAI_MODEL_SCOUT") or openai_model_default
+    openai_model_context = _optional_str("OPENAI_MODEL_CONTEXT") or openai_model_default
+    openai_model_edge = _optional_str("OPENAI_MODEL_EDGE") or openai_model_env or "gpt-4.1"
+    openai_model_critique = _optional_str("OPENAI_MODEL_CRITIQUE") or openai_model_default
+    openai_model_final = _optional_str("OPENAI_MODEL_FINAL") or openai_model_env or "o4-mini"
+    unified_poll_seconds = int(os.getenv("UNIFIED_POLL_SECONDS", "120"))
+    full_cycle_raw = _optional_str("UNIFIED_FULL_CYCLE_SECONDS")
+    if full_cycle_raw is not None:
+        unified_full_cycle_seconds = int(full_cycle_raw)
+    elif unified_poll_seconds != 120:
+        unified_full_cycle_seconds = int(unified_poll_seconds)
+    else:
+        unified_full_cycle_seconds = 900
+    unified_risk_watcher_seconds = int(_optional_str("UNIFIED_RISK_WATCHER_SECONDS") or "20")
     return Settings(
         kalshi_env=kalshi_env,
         kalshi_api_key_id=key_id,
         kalshi_private_key_path=priv_path,
         db_path=db_path,
-        openai_model=_optional_str("OPENAI_MODEL") or "gpt-4o-mini",
-        risk_max_yes_spread=risk_spread,
-        signal_lookback_hours=float(_optional_str("SIGNAL_LOOKBACK_HOURS") or "48"),
-        signal_max_snapshots_per_market=int(os.getenv("SIGNAL_MAX_SNAPSHOTS_PER_MARKET", "40")),
-        signal_min_snapshots=int(os.getenv("SIGNAL_MIN_SNAPSHOTS", "3")),
-        signal_stale_seconds=float(_optional_str("SIGNAL_STALE_SECONDS") or "1800"),
-        signal_max_mid_volatility=float(_optional_str("SIGNAL_MAX_MID_VOLATILITY") or "0.12"),
-        signal_max_single_tick_jump=float(_optional_str("SIGNAL_MAX_SINGLE_TICK_JUMP") or "0.2"),
-        min_signal_score_pipeline=min_sig_pipe,
-        min_signal_score_execution=min_sig_exec,
-        min_signal_score_guard=min_sig_guard,
-        signal_n_window=int(os.getenv("SIGNAL_N_WINDOW", "10")),
+        openai_model=openai_model_default,
+        openai_model_scout=openai_model_scout,
+        openai_model_context=openai_model_context,
+        openai_model_edge=openai_model_edge,
+        openai_model_critique=openai_model_critique,
+        openai_model_final=openai_model_final,
+        openweather_api_key=_optional_str("OPENWEATHER_API_KEY"),
+        openweather_ttl_seconds=max(30, int(os.getenv("OPENWEATHER_TTL_SECONDS", "300"))),
         unified_mode=unified_mode,
-        unified_poll_seconds=int(os.getenv("UNIFIED_POLL_SECONDS", "120")),
+        unified_poll_seconds=unified_poll_seconds,
+        unified_full_cycle_seconds=max(30, unified_full_cycle_seconds),
+        unified_risk_watcher_seconds=max(5, unified_risk_watcher_seconds),
         unified_horizon_days=int(os.getenv("UNIFIED_HORIZON_DAYS", "2")),
         unified_limit_candidates=int(os.getenv("UNIFIED_LIMIT_CANDIDATES", "24")),
         unified_max_entry_orders=int(os.getenv("UNIFIED_MAX_ENTRY_ORDERS", "4")),
@@ -158,6 +173,9 @@ def get_settings(*, load_dotenv_file: bool = True) -> Settings:
         unified_min_liquidity_contracts=float(_optional_str("UNIFIED_MIN_LIQUIDITY_CONTRACTS") or "8"),
         unified_repeat_market_cooldown_minutes=max(
             1, int(os.getenv("UNIFIED_REPEAT_MARKET_COOLDOWN_MINUTES", "60"))
+        ),
+        unified_repeat_thesis_cooldown_minutes=max(
+            1, int(os.getenv("UNIFIED_REPEAT_THESIS_COOLDOWN_MINUTES", "90"))
         ),
         unified_final_orchestrator_temperature=float(
             _optional_str("UNIFIED_FINAL_ORCHESTRATOR_TEMPERATURE") or "0.35"

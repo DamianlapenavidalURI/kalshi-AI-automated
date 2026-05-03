@@ -9,7 +9,6 @@ from kalshi_weather.system.contracts import (
     CandidateContext,
     EntryEdgeOutput,
     EntryFinalDecision,
-    EntryFusionOutput,
     EntryScoutOutput,
 )
 
@@ -101,6 +100,7 @@ def entry_context_agent(*, model: str, c: CandidateContext) -> dict[str, Any]:
             },
             "market_family": c.market_family,
             "web_research": c.web_research,
+            "evidence_bundle": _to_json_obj(c.evidence_bundle),
             "evidence_quality": c.evidence_quality,
             "freshness_meta": c.freshness_meta,
         },
@@ -119,6 +119,8 @@ def entry_edge_agent(*, model: str, c: CandidateContext) -> EntryEdgeOutput:
     sys = (
         "You are EdgeAgent. Estimate directional edge from prices/depth plus provided web_research context. "
         f"Market-family focus: {c.market_family} ({_family_brief(c.market_family)}). "
+        "When available, use normalized evidence_bundle and openweather payload as primary weather signal for "
+        "daily_temperature, hourly_temperature, and snow_and_rain families. "
         "Return strict JSON with edge_yes_prob(number in -0.2..0.2), confidence_0_1, side(yes|no), notes(array)."
     )
     user = json.dumps(
@@ -136,6 +138,7 @@ def entry_edge_agent(*, model: str, c: CandidateContext) -> EntryEdgeOutput:
             },
             "orderbook": c.orderbook,
             "market_family": c.market_family,
+            "evidence_bundle": _to_json_obj(c.evidence_bundle),
             "web_research": c.web_research,
             "evidence_quality": c.evidence_quality,
             "deterministic_inputs": c.deterministic_inputs,
@@ -195,49 +198,6 @@ def entry_critique_agent(*, model: str, c: CandidateContext, edge: EntryEdgeOutp
     )
 
 
-def entry_fusion_agent(
-    *,
-    model: str,
-    c: CandidateContext,
-    scout: EntryScoutOutput,
-    context: dict[str, Any],
-    edge: EntryEdgeOutput,
-    critique: dict[str, Any],
-) -> EntryFusionOutput:
-    sys = (
-        "You are EntryFusionAgent. Make final entry decision from scout/context/edge/critique. "
-        "Return strict JSON with proceed(bool), trust_score_0_100, side(yes|no), max_contracts(number), rationale(array)."
-    )
-    user = json.dumps(
-        {
-            "ticker": c.market_ticker,
-            "scout": _to_json_obj(scout),
-            "context": context,
-            "edge": _to_json_obj(edge),
-            "critique": critique,
-            "web_research": c.web_research,
-        },
-        ensure_ascii=False,
-    )[:12000]
-    out = call_llm_json(
-        model=model,
-        system=sys,
-        user=user,
-        temperature=0.1,
-        trace_label=f"[ENTRY][FUSION][{c.market_ticker}]",
-    )
-    side = str(out.get("side") or edge.side).lower()
-    rat = out.get("rationale")
-    rationale = [str(x) for x in rat] if isinstance(rat, list) else []
-    return EntryFusionOutput(
-        proceed=bool(out.get("proceed")),
-        trust_score_0_100=_f(out.get("trust_score_0_100")),
-        side="no" if side == "no" else "yes",
-        max_contracts=max(1.0, _f(out.get("max_contracts"))),
-        rationale=rationale,
-    )
-
-
 def entry_final_orchestrator_agent(
     *,
     model: str,
@@ -249,17 +209,49 @@ def entry_final_orchestrator_agent(
     portfolio_context: dict[str, Any],
     repeat_guard: dict[str, Any],
     exposure_context: dict[str, Any],
+    evidence_bundle: dict[str, Any] | None = None,
+    market_state: dict[str, Any] | None = None,
+    thesis_state: dict[str, Any] | None = None,
+    recent_decisions: list[dict[str, Any]] | None = None,
+    freshness_meta: dict[str, Any] | None = None,
     temperature: float = 0.35,
 ) -> EntryFinalDecision:
+    evidence_bundle = evidence_bundle or {}
+    market_state = market_state or {}
+    thesis_state = thesis_state or {}
+    recent_decisions = recent_decisions or []
+    freshness_meta = freshness_meta or {}
+    if bool(repeat_guard.get("repeat_blocked")) and (
+        "same_thesis_recent" in {str(x) for x in (repeat_guard.get("reasons") or [])}
+        or not bool(c.deterministic_inputs.get("evidence_novelty", True))
+    ):
+        return EntryFinalDecision(
+            decision="SKIP",
+            confidence_score_0_1=0.9,
+            recommended_side=edge.side,
+            recommended_size=0.0,
+            reasoning_summary="Same thesis was evaluated recently without meaningful new evidence.",
+            key_risks=["repeat_thesis", "low_novelty"],
+            repeat_bet_assessment="repeat_blocked",
+            exposure_assessment="unchanged",
+            required_follow_up_checks=["wait_for_new_forecast_update"],
+            structured_rejection_reasons=["same_thesis_no_new_information"],
+            repeat_flag=True,
+            exposure_flag=False,
+            novelty_assessment="no_new_information",
+            rejection_reasons=["same_thesis_no_new_information"],
+        )
+
     sys = (
         "You are FinalOrchestratorAgent for weather market entries. "
         "You decide final action using structured specialist outputs and constraints. "
         "Allowed decisions: ENTER, SKIP, WAIT, REDUCE_SIZE. "
-        "You must be especially careful about repeated betting and concentration risk. "
+        "You must be especially careful about repeated betting, novelty decay, and concentration risk. "
+        "If same thesis has no new information, choose SKIP. If repeated too recently choose SKIP or WAIT. "
+        "If confidence is borderline choose WAIT. If edge is positive but exposure is high choose REDUCE_SIZE or SKIP. "
         "Do not ignore deterministic hard-rail signals supplied in repeat_guard and exposure_context. "
-        "Return strict JSON with keys: decision, confidence_score, recommended_side, recommended_size, "
-        "reasoning_summary, key_risks(array), repeat_bet_assessment, exposure_assessment, "
-        "required_follow_up_checks(array), structured_rejection_reasons(array)."
+        "Return strict JSON with keys: decision, side, size, confidence, reasoning, repeat_flag, exposure_flag, "
+        "novelty_assessment, risks(array), required_follow_up_checks(array), rejection_reasons(array)."
     )
     user = json.dumps(
         {
@@ -278,8 +270,9 @@ def entry_final_orchestrator_agent(
             "orderbook": c.orderbook,
             "research": c.web_research,
             "evidence_quality": c.evidence_quality,
-            "freshness_meta": c.freshness_meta,
+            "freshness_meta": freshness_meta,
             "deterministic_inputs": c.deterministic_inputs,
+            "evidence_bundle": evidence_bundle,
             "specialists": {
                 "scout": _to_json_obj(scout),
                 "context": context,
@@ -289,6 +282,9 @@ def entry_final_orchestrator_agent(
             "portfolio_context": portfolio_context,
             "repeat_guard": repeat_guard,
             "exposure_context": exposure_context,
+            "market_state": market_state,
+            "thesis_state": thesis_state,
+            "recent_decisions": recent_decisions,
         },
         ensure_ascii=False,
     )[:16000]
@@ -302,21 +298,36 @@ def entry_final_orchestrator_agent(
     decision = str(out.get("decision") or "SKIP").upper()
     if decision not in {"ENTER", "SKIP", "WAIT", "REDUCE_SIZE"}:
         decision = "SKIP"
-    side = str(out.get("recommended_side") or edge.side).lower()
-    risks_raw = out.get("key_risks")
+    side = str(out.get("side") or out.get("recommended_side") or edge.side).lower()
+    risks_raw = out.get("risks") if isinstance(out.get("risks"), list) else out.get("key_risks")
     checks_raw = out.get("required_follow_up_checks")
-    reject_raw = out.get("structured_rejection_reasons")
+    reject_raw = out.get("rejection_reasons")
+    if not isinstance(reject_raw, list):
+        reject_raw = out.get("structured_rejection_reasons")
+    confidence = out.get("confidence")
+    if confidence is None:
+        confidence = out.get("confidence_score")
+    size = out.get("size")
+    if size is None:
+        size = out.get("recommended_size")
+    reasoning = out.get("reasoning")
+    if reasoning is None:
+        reasoning = out.get("reasoning_summary")
     return EntryFinalDecision(
         decision=decision,  # type: ignore[arg-type]
-        confidence_score_0_1=_clamp01(out.get("confidence_score")),
+        confidence_score_0_1=_clamp01(confidence),
         recommended_side="no" if side == "no" else "yes",
-        recommended_size=max(0.0, _f(out.get("recommended_size"))),
-        reasoning_summary=str(out.get("reasoning_summary") or ""),
+        recommended_size=max(0.0, _f(size)),
+        reasoning_summary=str(reasoning or ""),
         key_risks=[str(x) for x in risks_raw] if isinstance(risks_raw, list) else [],
         repeat_bet_assessment=str(out.get("repeat_bet_assessment") or ""),
         exposure_assessment=str(out.get("exposure_assessment") or ""),
         required_follow_up_checks=[str(x) for x in checks_raw] if isinstance(checks_raw, list) else [],
         structured_rejection_reasons=[str(x) for x in reject_raw] if isinstance(reject_raw, list) else [],
+        repeat_flag=bool(out.get("repeat_flag")),
+        exposure_flag=bool(out.get("exposure_flag")),
+        novelty_assessment=str(out.get("novelty_assessment") or ""),
+        rejection_reasons=[str(x) for x in reject_raw] if isinstance(reject_raw, list) else [],
     )
 
 

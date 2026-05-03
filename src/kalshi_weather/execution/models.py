@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-ExecutionMode = Literal["live", "dry_run", "shadow"]
+ExecutionMode = Literal["live", "dry_run"]
 
 ExecutionPolicy = Literal["post_only_gtc", "taker_ioc"]
 
@@ -40,6 +40,8 @@ class RiskLimits:
     per_event_max_loss_dollars: float | None = None
     rolling_matched_contracts_15s: float | None = None
     allow_scalar_and_combo: bool = False
+    min_market_liquidity_contracts: float | None = None
+    repeat_market_cooldown_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -55,8 +57,16 @@ class ExecutionEngineConfig:
 class OrderExecutionResult:
     intent: OrderIntent
     client_order_id: str
-    status: Literal["pending", "submitted", "risk_rejected", "skipped_read_only", "error"]
+    status: Literal[
+        "pending",
+        "submitted",
+        "risk_rejected",
+        "exchange_rejected",
+        "skipped_read_only",
+        "error",
+    ]
     reasons: list[str] = field(default_factory=list)
+    rejection_details: list[dict[str, Any]] = field(default_factory=list)
     api_response: dict[str, Any] | None = None
     fill_preview: FillPreview | None = None
     dry_run_body: dict[str, Any] | None = None

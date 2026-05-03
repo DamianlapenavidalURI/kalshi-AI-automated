@@ -19,7 +19,7 @@ from kalshi_weather.execution.models import (
 )
 from kalshi_weather.execution.risk import (
     RiskContext,
-    evaluate_intent,
+    evaluate_intent_with_details,
     rolling_batch_violation,
 )
 from kalshi_weather.kalshi.client import KalshiClient, KalshiHttpError
@@ -108,6 +108,55 @@ def _normalize_order_payload(resp: dict[str, Any]) -> dict[str, Any]:
     return resp
 
 
+def _classify_exchange_rejection(exc: KalshiHttpError) -> tuple[str, str] | None:
+    status = exc.status_code
+    if status is None or not (400 <= status <= 499):
+        return None
+    text = (exc.response_text or "").lower()
+    if "insufficient" in text and ("fund" in text or "balance" in text):
+        return ("insufficient_balance", "Exchange rejected order due to insufficient balance.")
+    if "duplicate" in text or "client_order_id" in text:
+        return ("duplicate_client_order_id", "Exchange rejected duplicate client_order_id.")
+    if "not open" in text or "inactive" in text or "closed" in text:
+        return ("market_not_open", "Exchange rejected order because market is not open.")
+    if "price" in text:
+        return ("invalid_price", "Exchange rejected order due to invalid or stale price.")
+    if "count" in text or "contracts" in text or "size" in text:
+        return ("invalid_size", "Exchange rejected order due to invalid size/contracts.")
+    return ("exchange_http_4xx", "Exchange rejected order with a 4xx response.")
+
+
+def _looks_retryable_submit_reject(exc: KalshiHttpError) -> bool:
+    status = exc.status_code
+    if status is None or not (400 <= status <= 499):
+        return False
+    text = (exc.response_text or "").lower()
+    hints = (
+        "price",
+        "quote",
+        "cross",
+        "tick",
+        "immediate_or_cancel",
+        "fill_or_kill",
+        "would not",
+    )
+    return any(h in text for h in hints)
+
+
+def _market_ask_for_side(client: KalshiClient, *, ticker: str, side: str) -> str | None:
+    m = client.get_market(ticker)
+    market = m.get("market") if isinstance(m, dict) else None
+    if not isinstance(market, dict):
+        return None
+    key = "no_ask_dollars" if side == "no" else "yes_ask_dollars"
+    try:
+        px = float(str(market.get(key)).strip())
+    except (TypeError, ValueError):
+        return None
+    px = max(0.01, min(0.99, px))
+    return f"{px:.4f}"
+
+
 def _preview_for_intent(
     intent: OrderIntent,
     orderbooks_by_ticker: dict[str, dict[str, Any]],
@@ -128,7 +177,7 @@ def _preview_for_intent(
 
 
 class KalshiExecutionEngine:
-    """Execution orchestration with risk, batching, and dry-run / shadow modes."""
+    """Execution orchestration with risk, batching, and dry-run/live modes."""
 
     def __init__(self, client: KalshiClient, config: ExecutionEngineConfig | None = None) -> None:
         self._client = client
@@ -221,6 +270,16 @@ class KalshiExecutionEngine:
                         client_order_id=it.client_order_id or "",
                         status="risk_rejected",
                         reasons=["rolling_matched_contract_ceiling"],
+                        rejection_details=[
+                            {
+                                "rail_name": "rolling_matched_contracts_15s",
+                                "severity": "critical",
+                                "current_value": "batch_plus_recent_exceeds_limit",
+                                "threshold": cfg.risk.rolling_matched_contracts_15s,
+                                "hard_blocking": True,
+                                "explanation": "Rolling matched contracts cap exceeded.",
+                            }
+                        ],
                         fill_preview=fp,
                     )
                 )
@@ -235,7 +294,7 @@ class KalshiExecutionEngine:
         cat_spent: dict[str, float] = {}
         evt_spent: dict[str, float] = {}
         for it in prepared:
-            reasons = evaluate_intent(
+            reasons, reason_details = evaluate_intent_with_details(
                 it,
                 limits=cfg.risk,
                 ctx=ctx,
@@ -250,6 +309,7 @@ class KalshiExecutionEngine:
                         client_order_id=it.client_order_id or "",
                         status="risk_rejected",
                         reasons=reasons,
+                        rejection_details=reason_details,
                         fill_preview=fp,
                     )
                 )
@@ -321,13 +381,33 @@ class KalshiExecutionEngine:
         batch_fallback: str | None = None
         used_batch = False
 
-        def submit_single(body: dict[str, Any]) -> dict[str, Any]:
-            return self._client.create_order(body)
+        def submit_single(body: dict[str, Any], *, intent: OrderIntent) -> dict[str, Any]:
+            try:
+                return self._client.create_order(body)
+            except KalshiHttpError as e:
+                if intent.policy != "taker_ioc":
+                    raise
+                if not _looks_retryable_submit_reject(e):
+                    raise
+                retried = dict(body)
+                retried["time_in_force"] = "good_till_canceled"
+                retried["post_only"] = False
+                refreshed_px = _market_ask_for_side(
+                    self._client,
+                    ticker=intent.ticker,
+                    side=intent.side,
+                )
+                if refreshed_px is not None:
+                    if intent.side == "yes":
+                        retried["yes_price_dollars"] = refreshed_px
+                    else:
+                        retried["no_price_dollars"] = refreshed_px
+                return self._client.create_order(retried)
 
         def submit_many(bs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             nonlocal used_batch, batch_fallback
             if len(bs) == 1:
-                resp = submit_single(bs[0])
+                resp = submit_single(bs[0], intent=pending[0].intent)
                 return [
                     {
                         "order": _normalize_order_payload(resp),
@@ -337,8 +417,8 @@ class KalshiExecutionEngine:
             prefer = cfg.prefer_batch and (self._batch_capable is not False)
             if not prefer:
                 out: list[dict[str, Any]] = []
-                for b in bs:
-                    resp = submit_single(b)
+                for i, b in enumerate(bs):
+                    resp = submit_single(b, intent=pending[i].intent)
                     out.append(
                         {
                             "order": _normalize_order_payload(resp),
@@ -357,8 +437,8 @@ class KalshiExecutionEngine:
                     self._batch_capable = False
                     batch_fallback = f"batch_unavailable:{e.status_code}"
                     out = []
-                    for b in bs:
-                        resp = submit_single(b)
+                    for i, b in enumerate(bs):
+                        resp = submit_single(b, intent=pending[i].intent)
                         out.append(
                             {
                                 "order": _normalize_order_payload(resp),
@@ -371,9 +451,29 @@ class KalshiExecutionEngine:
         try:
             raw_results = submit_many(bodies)
         except KalshiHttpError as e:
+            rejection = _classify_exchange_rejection(e)
             for r in pending:
-                r.status = "error"
-                r.error = str(e)
+                if rejection is None:
+                    r.status = "error"
+                    r.error = str(e)
+                else:
+                    reason, explanation = rejection
+                    r.status = "exchange_rejected"
+                    r.reasons = [reason]
+                    r.rejection_details = [
+                        {
+                            "rail_name": "exchange_submit",
+                            "severity": "critical",
+                            "current_value": e.status_code,
+                            "threshold": "HTTP 2xx",
+                            "hard_blocking": True,
+                            "explanation": explanation,
+                        }
+                    ]
+                    r.api_response = {
+                        "status_code": e.status_code,
+                        "response_text": e.response_text,
+                    }
             return BatchExecutionResult(
                 results=results,
                 used_batch_endpoint=used_batch,

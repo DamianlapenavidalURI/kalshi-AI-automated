@@ -19,11 +19,16 @@ _WEATHER_DISCOVERY_PAT = re.compile(
 _FAMILY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("hurricanes", re.compile(r"\b(hurricane|tropical storm|landfall|cyclone)\b", re.I)),
     ("natural_disasters", re.compile(r"\b(earthquake|wildfire|flood|tornado|disaster|eruption)\b", re.I)),
-    ("snow_and_rain", re.compile(r"\b(rain|snow|precip|sleet|inches)\b", re.I)),
+    ("snow_and_rain", re.compile(r"\b(rain|rainfall|snow|precip|precipitation|sleet|inch|inches)\b", re.I)),
     ("hourly_temperature", re.compile(r"\b(hourly|hour|by \d{1,2}(am|pm)|:00)\b", re.I)),
     ("daily_temperature", re.compile(r"\b(today|tomorrow|daily|high|low|temperature|degrees)\b", re.I)),
     ("climate_change", re.compile(r"\b(climate|warming|el nino|la nina|co2|emission)\b", re.I)),
 )
+_TEMP_STRONG_PAT = re.compile(
+    r"\b(max(?:imum)? temperature|min(?:imum)? temperature|high temperature|low temperature|degrees?)\b",
+    re.I,
+)
+_PRECIP_STRONG_PAT = re.compile(r"\b(rain|rainfall|snow|precip|precipitation|sleet|inch|inches)\b", re.I)
 
 
 def _f(x: Any) -> float | None:
@@ -35,9 +40,30 @@ def _f(x: Any) -> float | None:
         return None
 
 
+def _short_horizon_reason(hours_to_close: float | None, *, fallback: bool = False) -> str:
+    htxt = f"{hours_to_close:.1f}" if hours_to_close is not None else "unknown"
+    prefix = "short_horizon_fb" if fallback else "short_horizon"
+    return f"{prefix}:{htxt}h"
+
+
 def _detect_market_family(
     *, market: dict[str, Any], event: dict[str, Any] | None = None, fallback: str = "daily_temperature"
 ) -> str:
+    ticker = str(market.get("ticker") or market.get("market_ticker") or "").upper()
+    if ticker.startswith("KXHIGH") or ticker.startswith("KXLOW") or ticker.startswith("KXTEMP"):
+        title_blob = " ".join(
+            str(x or "")
+            for x in (
+                market.get("title"),
+                market.get("rules_primary"),
+                market.get("rules_secondary"),
+                (event or {}).get("title") if isinstance(event, dict) else "",
+            )
+        )
+        if re.search(r"\b(hour|hourly|by \d{1,2}(am|pm)|:00)\b", title_blob, re.I):
+            return "hourly_temperature"
+        return "daily_temperature"
+
     blob = " ".join(
         str(x or "")
         for x in (
@@ -50,10 +76,31 @@ def _detect_market_family(
             (event or {}).get("sub_title") if isinstance(event, dict) else "",
         )
     )
+    has_temp = bool(_TEMP_STRONG_PAT.search(blob))
+    has_precip = bool(_PRECIP_STRONG_PAT.search(blob))
+    if has_temp and not has_precip:
+        if re.search(r"\b(hour|hourly|by \d{1,2}(am|pm)|:00)\b", blob, re.I):
+            return "hourly_temperature"
+        return "daily_temperature"
+
     for family_id, pat in _FAMILY_PATTERNS:
         if pat.search(blob):
             return family_id
     return fallback
+
+
+def _resolved_family_id(*, discovered_family: str | None, market: dict[str, Any], event: dict[str, Any]) -> str:
+    # Keep one reconciliation rule for all families:
+    # use discovery family when detection is unknown; otherwise trust
+    # detection so we do not keep inconsistent family assignments.
+    detected = _detect_market_family(market=market, event=event, fallback="unknown")
+    if detected != "unknown":
+        return detected
+    if discovered_family:
+        df = str(discovered_family).strip().lower()
+        if df:
+            return df
+    return "daily_temperature"
 
 
 def _looks_like_weather_market(market: dict[str, Any]) -> bool:
@@ -153,7 +200,11 @@ def load_weather_candidates_within_days(
             continue
         if c.hours_to_close is None or c.hours_to_close <= 0 or c.hours_to_close > max_hours:
             continue
-        family_id = c.family_id if c.family_id else _detect_market_family(market=market, event=c.event or {})
+        family_id = _resolved_family_id(
+            discovered_family=c.family_id,
+            market=market,
+            event=c.event if isinstance(c.event, dict) else {},
+        )
         shortlisted.append(
             (
                 c.market_ticker,
@@ -185,6 +236,9 @@ def load_weather_candidates_within_days(
         ob = orderbooks.get(mt)
         if ob is None:
             continue
+        event_market_count = int(market.get("event_market_count") or 0)
+        market_option_kind = str(market.get("market_option_kind") or "").strip() or "unknown"
+        market_option_label = str(market.get("market_option_label") or market.get("title") or "").strip()
         out.append(
             CandidateContext(
                 market_ticker=mt,
@@ -192,12 +246,18 @@ def load_weather_candidates_within_days(
                 market=market,
                 event=event,
                 orderbook=ob,
-                horizon_reason=f"weather_short_horizon:close_within_{hours_to_close:.1f}h",
+                horizon_reason=_short_horizon_reason(hours_to_close),
                 web_research={},
                 evidence_quality={"source_count": 0, "score_0_100": 0.0},
                 freshness_meta={"loaded_at": now_iso},
                 source_reliability={},
-                deterministic_inputs={"prequal_score": prequal_score, "family_source": "discovery"},
+                deterministic_inputs={
+                    "prequal_score": prequal_score,
+                    "family_source": "discovery",
+                    "event_market_count": event_market_count,
+                    "market_option_kind": market_option_kind,
+                    "market_option_label": market_option_label,
+                },
             )
         )
     if out:
@@ -232,7 +292,6 @@ def load_weather_candidates_within_days(
         if ob is None:
             continue
         htc = hours_to_close_from_market(market)
-        htxt = f"{htc:.1f}" if htc is not None else "unknown"
         family_id = _detect_market_family(market=market, event={})
         out.append(
             CandidateContext(
@@ -241,12 +300,20 @@ def load_weather_candidates_within_days(
                 market=market,
                 event={},
                 orderbook=ob,
-                horizon_reason=f"weather_short_horizon_fallback:close_within_{htxt}h",
+                horizon_reason=_short_horizon_reason(htc, fallback=True),
                 web_research={},
                 evidence_quality={"source_count": 0, "score_0_100": 0.0},
                 freshness_meta={"loaded_at": now_iso},
                 source_reliability={},
-                deterministic_inputs={"prequal_score": 0.0, "family_source": "fallback_regex"},
+                deterministic_inputs={
+                    "prequal_score": 0.0,
+                    "family_source": "fallback_regex",
+                    "event_market_count": int(market.get("event_market_count") or 0),
+                    "market_option_kind": str(market.get("market_option_kind") or "").strip() or "unknown",
+                    "market_option_label": str(
+                        market.get("market_option_label") or market.get("title") or ""
+                    ).strip(),
+                },
             )
         )
         if len(out) >= limit_markets:

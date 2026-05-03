@@ -131,27 +131,136 @@ class RiskContext:
     now_ts: float
 
 
-def evaluate_intent(
+def _rail_detail(
+    *,
+    rail_name: str,
+    severity: str,
+    current_value: Any,
+    threshold: Any,
+    hard_blocking: bool,
+    explanation: str,
+) -> dict[str, Any]:
+    return {
+        "rail_name": rail_name,
+        "severity": severity,
+        "current_value": current_value,
+        "threshold": threshold,
+        "hard_blocking": hard_blocking,
+        "explanation": explanation,
+    }
+
+
+def _market_liquidity_contracts(market: dict[str, Any]) -> float:
+    return max(
+        0.0,
+        (_f(market.get("yes_bid_size_fp")) or 0.0)
+        + (_f(market.get("yes_ask_size_fp")) or 0.0)
+        + (_f(market.get("no_bid_size_fp")) or 0.0)
+        + (_f(market.get("no_ask_size_fp")) or 0.0),
+    )
+
+
+def _recent_fill_count_same_ticker(
+    *, fills: list[dict[str, Any]], ticker: str, now_ts: float, cooldown_s: float
+) -> int:
+    cutoff = now_ts - cooldown_s
+    hits = 0
+    for f in fills:
+        if not isinstance(f, dict):
+            continue
+        mt = str(f.get("ticker") or f.get("market_ticker") or "")
+        if mt != ticker:
+            continue
+        t = _parse_fill_ts(f)
+        if t is None:
+            continue
+        if t >= cutoff:
+            hits += 1
+    return hits
+
+
+def evaluate_intent_with_details(
     intent: OrderIntent,
     *,
     limits: RiskLimits,
     ctx: RiskContext,
     category_batch_spent_dollars: dict[str, float] | None = None,
     event_batch_spent_dollars: dict[str, float] | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[dict[str, Any]]]:
     reasons: list[str] = []
+    details: list[dict[str, Any]] = []
     m = ctx.markets_by_ticker.get(intent.ticker)
     if not m:
         reasons.append("missing_market_metadata")
-        return reasons
+        details.append(
+            _rail_detail(
+                rail_name="market_metadata",
+                severity="critical",
+                current_value=None,
+                threshold="metadata_required",
+                hard_blocking=True,
+                explanation="Market metadata was missing for this ticker.",
+            )
+        )
+        return reasons, details
 
+    status = str(m.get("status") or "").lower()
+    if status not in {"active", "initialized", "open"}:
+        reasons.append("market_not_open")
+        details.append(
+            _rail_detail(
+                rail_name="market_open",
+                severity="critical",
+                current_value=status,
+                threshold="active|initialized|open",
+                hard_blocking=True,
+                explanation="Market status is not open.",
+            )
+        )
+
+    if limits.min_market_liquidity_contracts is not None:
+        liq = _market_liquidity_contracts(m)
+        if liq < limits.min_market_liquidity_contracts:
+            reasons.append("insufficient_liquidity")
+            details.append(
+                _rail_detail(
+                    rail_name="basic_liquidity",
+                    severity="critical",
+                    current_value=liq,
+                    threshold=limits.min_market_liquidity_contracts,
+                    hard_blocking=True,
+                    explanation="Visible orderbook liquidity is below configured floor.",
+                )
+            )
+
+    if limits.repeat_market_cooldown_seconds is not None and limits.repeat_market_cooldown_seconds > 0:
+        pos = abs(_market_position_fp(ctx.positions, intent.ticker))
+        fills = _recent_fill_count_same_ticker(
+            fills=ctx.recent_fills,
+            ticker=intent.ticker,
+            now_ts=ctx.now_ts,
+            cooldown_s=limits.repeat_market_cooldown_seconds,
+        )
+        if pos > 0.0 or fills > 0:
+            reasons.append("repeat_market_cooldown")
+            details.append(
+                _rail_detail(
+                    rail_name="anti_repeat_buffer",
+                    severity="critical",
+                    current_value={"open_position_contracts": pos, "recent_fill_count": fills},
+                    threshold={"cooldown_seconds": limits.repeat_market_cooldown_seconds},
+                    hard_blocking=True,
+                    explanation="Recent or open same-market exposure triggered anti-repeat guard.",
+                )
+            )
+
+    # Backward-compatible optional limits; only enforced if explicitly configured.
     if market_blocked_for_scalar_combo(m, allow=limits.allow_scalar_and_combo):
         reasons.append("scalar_or_combo_blocked")
 
     cnt = abs(_f(intent.count_fp))
     pos = _market_position_fp(ctx.positions, intent.ticker)
     if limits.per_market_max_contracts is not None:
-        # Conservative: current net YES position + new BUY YES increases long exposure
         projected = abs(pos) + cnt
         if projected > limits.per_market_max_contracts + 1e-6:
             reasons.append("per_market_max_contracts")
@@ -171,6 +280,24 @@ def evaluate_intent(
         if ev + prior_ev + incremental > limits.per_event_max_loss_dollars + 1e-6:
             reasons.append("per_event_max_loss")
 
+    return reasons, details
+
+
+def evaluate_intent(
+    intent: OrderIntent,
+    *,
+    limits: RiskLimits,
+    ctx: RiskContext,
+    category_batch_spent_dollars: dict[str, float] | None = None,
+    event_batch_spent_dollars: dict[str, float] | None = None,
+) -> list[str]:
+    reasons, _ = evaluate_intent_with_details(
+        intent,
+        limits=limits,
+        ctx=ctx,
+        category_batch_spent_dollars=category_batch_spent_dollars,
+        event_batch_spent_dollars=event_batch_spent_dollars,
+    )
     return reasons
 
 
