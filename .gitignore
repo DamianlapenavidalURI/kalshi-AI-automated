@@ -32,3 +32,6 @@ htmlcov/
 # OS/editor
 .DS_Store
 .vscode/
+
+# Cursor local/editor state
+.cursor/

@@ -892,7 +892,7 @@ class Db:
             ).fetchone()[0]
         return {"total": int(total), "approved": int(ap), "rejected": int(rj)}
 
-    def list_proposals_eligible_for_demo_execution(
+    def list_proposals_eligible_for_execution(
         self, *, limit: int, max_proposal_age_minutes: int
     ) -> list[sqlite3.Row]:
         age_mod = f"-{int(max_proposal_age_minutes)} minutes"
@@ -921,7 +921,7 @@ class Db:
             )
             return list(cur.fetchall())
 
-    def has_resting_demo_order_for_market(
+    def has_resting_execution_order_for_market(
         self, conn: sqlite3.Connection, market_ticker: str
     ) -> bool:
         cur = conn.execute(
@@ -936,7 +936,7 @@ class Db:
         )
         return cur.fetchone() is not None
 
-    def insert_demo_order_on_connection(
+    def insert_execution_order_on_connection(
         self,
         conn: sqlite3.Connection,
         *,
@@ -978,7 +978,7 @@ class Db:
             ),
         )
 
-    def update_demo_order_status_on_connection(
+    def update_execution_order_status_on_connection(
         self,
         conn: sqlite3.Connection,
         *,
@@ -995,7 +995,7 @@ class Db:
             (order_status, response_json, internal_id),
         )
 
-    def list_demo_orders_for_reconciliation(self, *, limit: int) -> list[sqlite3.Row]:
+    def list_execution_orders_for_reconciliation(self, *, limit: int) -> list[sqlite3.Row]:
         with self.connect() as conn:
             cur = conn.execute(
                 """
@@ -1011,7 +1011,7 @@ class Db:
             )
             return list(cur.fetchall())
 
-    def recent_demo_orders(self, *, limit: int = 100) -> list[sqlite3.Row]:
+    def recent_execution_orders(self, *, limit: int = 100) -> list[sqlite3.Row]:
         with self.connect() as conn:
             cur = conn.execute(
                 """
@@ -1026,7 +1026,7 @@ class Db:
             )
             return list(cur.fetchall())
 
-    def demo_orders_summary(self) -> dict[str, Any]:
+    def execution_orders_summary(self) -> dict[str, Any]:
         with self.connect() as conn:
             total = int(conn.execute("SELECT COUNT(*) FROM execution_orders").fetchone()[0])
             dry = int(
