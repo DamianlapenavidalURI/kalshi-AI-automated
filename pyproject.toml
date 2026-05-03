@@ -1,7 +1,7 @@
 [project]
-name = "kalshi-weather-demo"
+name = "kalshi-weather-automation"
 version = "0.1.0"
-description = "AI-assisted weather betting system (Kalshi demo)"
+description = "AI-assisted weather betting automation system (Kalshi demo/live)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,6 +14,7 @@ dependencies = [
   "langsmith>=0.1.0",
   "python-dotenv>=1.0.0",
   "requests>=2.31.0",
+  "altair>=5.0.0",
   "streamlit>=1.35.0",
 ]
 
