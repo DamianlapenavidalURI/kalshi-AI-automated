@@ -1,4 +1,4 @@
-You are helping me build a 3-week project in Cursor: Automated Kalshi Weather Betting System.
+You are helping me build a 3-week project in Cursor: Kalshi Weather Market Analysis and Trading Automation.
 
 Project constraints:
 - Use Cursor and its AI coding agents to implement the system

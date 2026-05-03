@@ -1,4 +1,4 @@
-# Automated **Kalshi Weather Betting System**
+# Kalshi Weather Market Analysis and Trading Automation
 
 Local-first, weather-focused Kalshi trading system for discovery, AI-assisted idea generation, deterministic risk filtering, and dashboard monitoring.
 
@@ -18,7 +18,7 @@ This project is designed for fast iteration and safe automation:
 
 ### 2) Project Title
 
-- **Automated Kalshi Weather Betting System**  
+- **Kalshi Weather Market Analysis and Trading Automation**  
 AI-assisted, deterministic, local-first weather market automation for Kalshi demo/live trading.
 
 ### 3) Clear Project Description
