@@ -48,6 +48,8 @@ class UnifiedWeatherOrchestratorConfig:
     max_contracts_per_order: float = 8.0
     rolling_matched_contracts_15s: float = 40.0
     candidate_scan_multiplier: int = 4
+    candidate_selection_mode: str = "ranked"
+    candidate_selection_pool_multiplier: int = 3
     scout_override_priority_0_100: float = 70.0
     data_fetch_workers: int = 8
     weather_series_tag: str | None = None
@@ -735,11 +737,16 @@ def _plan_entry_intents(
 
 def _portfolio_diagnostics(positions_payload: dict[str, Any]) -> dict[str, float | int]:
     market_positions = positions_payload.get("market_positions")
-    active_positions = (
+    raw_positions = (
         [x for x in market_positions if isinstance(x, dict)]
         if isinstance(market_positions, list)
         else []
     )
+    active_positions: list[dict[str, Any]] = []
+    for mp in raw_positions:
+        p = _f(mp.get("position_fp")) or 0.0
+        if abs(p) > 0.0:
+            active_positions.append(mp)
     total_abs_contracts = 0.0
     total_abs_exposure = 0.0
     for mp in active_positions:
@@ -769,6 +776,8 @@ def run_unified_weather_cycle(
             "restricted_to_live_bets": bool(cfg.restricted_to_live_bets),
             "restricted_to_weather_family": bool(cfg.restricted_to_weather_family),
             "limit_driver": "horizon_days",
+            "candidate_selection_mode": cfg.candidate_selection_mode,
+            "candidate_selection_pool_multiplier": cfg.candidate_selection_pool_multiplier,
             "notes": cfg.selection_policy_notes,
         },
         "entry": {},
@@ -797,6 +806,8 @@ def run_unified_weather_cycle(
         limit_markets=candidate_scan_target,
         data_fetch_workers=max(1, int(cfg.data_fetch_workers)),
         weather_series_tag=cfg.weather_series_tag,
+        candidate_selection_mode=cfg.candidate_selection_mode,
+        candidate_selection_pool_multiplier=max(1, int(cfg.candidate_selection_pool_multiplier)),
     )
     diagnostics["stage_timing_s"]["entry_candidate_load"] = round(time.perf_counter() - t_entry_load0, 3)
     logger.info(

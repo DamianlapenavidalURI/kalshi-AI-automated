@@ -290,6 +290,8 @@ Unified runtime controls:
 - `UNIFIED_REPEAT_THESIS_COOLDOWN_MINUTES`: cooldown before repeating same thesis.
 - `UNIFIED_FINAL_ORCHESTRATOR_TEMPERATURE`: temperature for final orchestrator model call.
 - `UNIFIED_CANDIDATE_SCAN_MULTIPLIER`: breadth multiplier before narrowing to final entry set.
+- `UNIFIED_CANDIDATE_SELECTION_MODE`: candidate slice policy (`ranked`, `random`, or `random_all`) after prefiltering.
+- `UNIFIED_CANDIDATE_SELECTION_POOL_MULTIPLIER`: in `random` mode, sample from top `limit * multiplier` (ignored in `ranked` and `random_all`).
 - `UNIFIED_SCOUT_OVERRIDE_PRIORITY`: threshold allowing Scout soft-reject override.
 - `UNIFIED_DATA_FETCH_WORKERS`: worker count for market/orderbook hydration.
 - `UNIFIED_WEATHER_SERIES_TAG`: optional series filter (blank = no filter).

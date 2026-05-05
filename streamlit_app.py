@@ -11,6 +11,8 @@ import altair as alt
 import streamlit as st
 
 from kalshi_weather.config import get_settings
+from kalshi_weather.kalshi.auth import KalshiAuth
+from kalshi_weather.kalshi.client import KalshiClient, KalshiHttpError
 
 
 def _safe_int(x: Any) -> int:
@@ -25,6 +27,12 @@ def _safe_float(x: Any) -> float:
         return float(x or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _fmt_mmss(seconds: Any) -> str:
+    total = max(0, int(round(_safe_float(seconds))))
+    mins, secs = divmod(total, 60)
+    return f"{mins:02d}:{secs:02d}"
 
 
 def _compact_horizon_reason(value: Any) -> Any:
@@ -146,6 +154,85 @@ def _query_rows(db_path: Path, sql: str, params: tuple[Any, ...] = ()) -> list[d
     return [dict(r) for r in rows]
 
 
+@st.cache_resource(show_spinner=False)
+def _build_kalshi_client_for_dashboard(
+    *,
+    base_url: str,
+    api_key_id: str | None,
+    private_key_path: str | None,
+) -> KalshiClient | None:
+    if not api_key_id or not private_key_path:
+        return None
+    try:
+        auth = KalshiAuth.from_pem_file(
+            api_key_id=api_key_id,
+            private_key_path=Path(private_key_path).expanduser(),
+        )
+        return KalshiClient(base_url=base_url, auth=auth)
+    except Exception:
+        return None
+
+
+def _load_live_account_snapshot(
+    *,
+    settings: Any,
+) -> dict[str, Any]:
+    client = _build_kalshi_client_for_dashboard(
+        base_url=str(settings.kalshi_base_url),
+        api_key_id=settings.kalshi_api_key_id,
+        private_key_path=(
+            str(settings.kalshi_private_key_path)
+            if settings.kalshi_private_key_path is not None
+            else None
+        ),
+    )
+    if client is None:
+        return {"ok": False, "error": "missing_or_invalid_kalshi_auth"}
+    try:
+        positions_payload = client.get_positions(limit=500)
+        fills_payload = client.get_fills(limit=300)
+    except KalshiHttpError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:  # pragma: no cover - network/API runtime variability
+        return {"ok": False, "error": str(e)}
+
+    positions_raw = positions_payload.get("market_positions")
+    positions = [x for x in positions_raw if isinstance(x, dict)] if isinstance(positions_raw, list) else []
+    open_positions = [p for p in positions if abs(_safe_float(p.get("position_fp"))) > 0.0]
+    fills_raw = fills_payload.get("fills")
+    fills = [x for x in fills_raw if isinstance(x, dict)] if isinstance(fills_raw, list) else []
+    unique_fill_order_ids = {
+        str(f.get("order_id") or "").strip()
+        for f in fills
+        if str(f.get("order_id") or "").strip()
+    }
+    unique_fill_tickers = {
+        str(f.get("ticker") or "").strip()
+        for f in fills
+        if str(f.get("ticker") or "").strip()
+    }
+    unique_fill_ticker_side = {
+        (
+            str(f.get("ticker") or "").strip(),
+            str(f.get("side") or "").strip().lower(),
+        )
+        for f in fills
+        if str(f.get("ticker") or "").strip()
+    }
+    total_abs_exposure = sum(abs(_safe_float(p.get("market_exposure_dollars"))) for p in open_positions)
+    return {
+        "ok": True,
+        "open_positions_count": len(open_positions),
+        "total_abs_exposure_dollars": total_abs_exposure,
+        "recent_fills_count": len(fills),
+        "recent_fills_unique_order_ids": len(unique_fill_order_ids),
+        "recent_fills_unique_markets": len(unique_fill_tickers),
+        "recent_fills_unique_market_sides": len(unique_fill_ticker_side),
+        "open_positions": open_positions,
+        "recent_fills": fills,
+    }
+
+
 def _load_trade_activity_rows(*, db_path: Path, limit: int = 150) -> list[dict[str, Any]]:
     sql = """
     SELECT
@@ -264,25 +351,6 @@ def _render_event_market_structure(*, output_path: Path) -> None:
     st.markdown("**Event summary**")
     st.dataframe(event_rows, use_container_width=True)
 
-    with st.expander("View event -> market option mapping", expanded=False):
-        mapping_rows: list[dict[str, Any]] = []
-        for event_ticker, event_markets in sorted(grouped.items(), key=lambda kv: kv[0]):
-            for row in event_markets:
-                mapping_rows.append(
-                    {
-                        "event_ticker": event_ticker,
-                        "event_title": row.get("event_title"),
-                        "market_ticker": row.get("ticker"),
-                        "market_title": row.get("market_title"),
-                        "option_label": row.get("market_option_label"),
-                        "option_kind": row.get("market_option_kind"),
-                        "decision": row.get("decision"),
-                        "reason": row.get("reason"),
-                    }
-                )
-        st.dataframe(mapping_rows, use_container_width=True)
-
-
 def _render_bar_chart_with_horizontal_labels(
     counts: dict[str, float], *, x_title: str = "Category", y_title: str = "Count"
 ) -> None:
@@ -331,14 +399,13 @@ def _render_runtime_health(*, output_path: Path) -> None:
 
     modified_at = datetime.fromtimestamp(output_path.stat().st_mtime, tz=timezone.utc)
     age_s = max(0.0, (datetime.now(timezone.utc) - modified_at).total_seconds())
-    c = st.columns(7)
+    c = st.columns(6)
     c[0].metric("Mode", str(unified.get("mode") or "n/a"))
-    c[1].metric("Cycle age (s)", f"{age_s:.0f}")
+    c[1].metric("Time since last run", _fmt_mmss(age_s))
     c[2].metric("Candidates seen", _safe_int(entry_d.get("candidates_seen")))
     c[3].metric("Buy intents", _safe_int(entry_d.get("intents_attempted")))
     c[4].metric("Open positions", _safe_int(portfolio_d.get("open_positions_seen")))
-    c[5].metric("Deep research (s)", f"{deep_research_s:.3f}" if deep_research_s else "n/a")
-    c[6].metric("Total cycle (s)", f"{total_cycle_s:.3f}" if total_cycle_s else "n/a")
+    c[5].metric("Total cycle", _fmt_mmss(total_cycle_s) if total_cycle_s else "n/a")
 
     if stage_timing_d:
         st.caption("Latest stage timings (seconds)")
@@ -405,11 +472,12 @@ def _render_entry_diagnostics(*, output_path: Path) -> None:
         st.json(unified)
 
 
-def _render_user_dashboard(*, output_path: Path, db_path: Path) -> None:
+def _render_user_dashboard(*, output_path: Path, db_path: Path, settings: Any) -> None:
     st.subheader("Performance & Bets")
     unified = _load_unified_agent_output(output_path)
     trade_rows = _load_trade_activity_rows(db_path=db_path, limit=200)
     state_rows = _load_market_state_rows(db_path=db_path, limit=500)
+    live_account = _load_live_account_snapshot(settings=settings)
 
     if not trade_rows and unified is None:
         st.info(
@@ -419,9 +487,16 @@ def _render_user_dashboard(*, output_path: Path, db_path: Path) -> None:
         return
 
     live_trade_rows = [r for r in trade_rows if _safe_int(r.get("dry_run")) == 0]
-    total_bets = len(live_trade_rows)
-    executed_orders = sum(1 for r in live_trade_rows if str(r.get("order_status") or "") == "executed")
-    active_bets = sum(1 for r in state_rows if abs(_safe_float(r.get("open_position_size"))) > 0.0)
+    db_total_bets = len(live_trade_rows)
+    db_executed_orders = sum(1 for r in live_trade_rows if str(r.get("order_status") or "") == "executed")
+    db_active_bets = sum(1 for r in state_rows if abs(_safe_float(r.get("open_position_size"))) > 0.0)
+    api_recent_fills = _safe_int(live_account.get("recent_fills_count")) if live_account.get("ok") else 0
+    api_bets_deduped = _safe_int(live_account.get("recent_fills_unique_markets")) if live_account.get("ok") else 0
+    api_executed_deduped = _safe_int(live_account.get("recent_fills_unique_markets")) if live_account.get("ok") else 0
+    api_active_bets = _safe_int(live_account.get("open_positions_count")) if live_account.get("ok") else 0
+    total_bets = max(db_total_bets, api_bets_deduped)
+    executed_orders = min(total_bets, max(db_executed_orders, api_executed_deduped))
+    active_bets = max(db_active_bets, api_active_bets)
     execution_success_rate = (executed_orders / total_bets) if total_bets > 0 else 0.0
     estimated_money_used = sum(
         _safe_float(r.get("proposed_limit_price_dollars")) * max(0.0, _safe_float(r.get("proposed_quantity")))
@@ -437,6 +512,20 @@ def _render_user_dashboard(*, output_path: Path, db_path: Path) -> None:
     c[2].metric("Active bets", active_bets)
     c[3].metric("Estimated PnL", f"${total_pnl_estimate:.2f}")
     c[4].metric("Estimated ROI", f"{estimated_roi * 100:.1f}%")
+    if live_account.get("ok"):
+        st.caption(
+            "Live account snapshot: "
+            f"open_positions={_safe_int(live_account.get('open_positions_count'))}, "
+            f"fills={_safe_int(live_account.get('recent_fills_count'))}, "
+            f"unique_markets={_safe_int(live_account.get('recent_fills_unique_markets'))}, "
+            f"unique_order_ids={_safe_int(live_account.get('recent_fills_unique_order_ids'))}, "
+            f"exposure=${_safe_float(live_account.get('total_abs_exposure_dollars')):.2f}"
+        )
+    else:
+        st.caption(
+            "Live account snapshot unavailable; showing DB-only metrics. "
+            f"Reason: {live_account.get('error') or 'unknown'}"
+        )
 
     if live_trade_rows:
         pnl_by_ticker = {str(r.get("ticker") or ""): _safe_float(r.get("pnl_estimate")) for r in state_rows}
@@ -521,7 +610,7 @@ def main() -> None:
 
     if st.session_state.dashboard_view == "User":
         st.caption("User dashboard: trade visibility and system performance.")
-        _render_user_dashboard(output_path=output_path, db_path=db_path)
+        _render_user_dashboard(output_path=output_path, db_path=db_path, settings=s)
     else:
         st.caption(f"Unified output: `{output_path}`")
         st.caption(f"Database: `{db_path}`")

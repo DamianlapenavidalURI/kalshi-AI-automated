@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -167,6 +168,30 @@ def _fetch_orderbook_or_none(client: KalshiClient, ticker: str) -> dict[str, Any
     return ob if isinstance(ob, dict) else None
 
 
+def _select_shortlisted_candidates(
+    *,
+    shortlisted: list[tuple[str, dict[str, Any], dict[str, Any], float, str, float]],
+    limit_markets: int,
+    selection_mode: str,
+    selection_pool_multiplier: int,
+) -> list[tuple[str, dict[str, Any], dict[str, Any], float, str, float]]:
+    if len(shortlisted) <= limit_markets:
+        return shortlisted
+    if selection_mode == "random_all":
+        pool = list(shortlisted)
+        random.SystemRandom().shuffle(pool)
+        return pool[:limit_markets]
+    if selection_mode == "random":
+        pool_n = min(
+            len(shortlisted),
+            max(limit_markets, int(limit_markets * max(1, int(selection_pool_multiplier)))),
+        )
+        pool = list(shortlisted[:pool_n])
+        random.SystemRandom().shuffle(pool)
+        return pool[:limit_markets]
+    return shortlisted[:limit_markets]
+
+
 def load_weather_candidates_within_days(
     client: KalshiClient,
     *,
@@ -174,6 +199,8 @@ def load_weather_candidates_within_days(
     limit_markets: int,
     data_fetch_workers: int = 8,
     weather_series_tag: str | None = None,
+    candidate_selection_mode: str = "ranked",
+    candidate_selection_pool_multiplier: int = 3,
 ) -> list[CandidateContext]:
     min_close_ts = int(datetime.now(timezone.utc).timestamp())
     normalized_weather_tag = (weather_series_tag or "").strip()
@@ -193,6 +220,16 @@ def load_weather_candidates_within_days(
     )
     out: list[CandidateContext] = []
     max_hours = float(horizon_days * 24)
+    selection_mode = str(candidate_selection_mode or "ranked").strip().lower()
+    if selection_mode not in {"ranked", "random", "random_all"}:
+        selection_mode = "ranked"
+    max_shortlist: int | None
+    if selection_mode == "random":
+        max_shortlist = max(limit_markets, limit_markets * max(1, int(candidate_selection_pool_multiplier)))
+    elif selection_mode == "random_all":
+        max_shortlist = None
+    else:
+        max_shortlist = limit_markets
     shortlisted: list[tuple[str, dict[str, Any], dict[str, Any], float, str, float]] = []
     for c in result.candidates:
         market = c.market if isinstance(c.market, dict) else None
@@ -215,8 +252,14 @@ def load_weather_candidates_within_days(
                 c.score,
             )
         )
-        if len(shortlisted) >= limit_markets:
+        if max_shortlist is not None and len(shortlisted) >= max_shortlist:
             break
+    shortlisted = _select_shortlisted_candidates(
+        shortlisted=shortlisted,
+        limit_markets=limit_markets,
+        selection_mode=selection_mode,
+        selection_pool_multiplier=max(1, int(candidate_selection_pool_multiplier)),
+    )
 
     orderbooks: dict[str, dict[str, Any]] = {}
     if shortlisted:
@@ -328,6 +371,8 @@ def load_candidates_within_days(
     limit_markets: int,
     data_fetch_workers: int = 8,
     weather_series_tag: str | None = None,
+    candidate_selection_mode: str = "ranked",
+    candidate_selection_pool_multiplier: int = 3,
 ) -> list[CandidateContext]:
     return load_weather_candidates_within_days(
         client,
@@ -335,5 +380,7 @@ def load_candidates_within_days(
         limit_markets=limit_markets,
         data_fetch_workers=data_fetch_workers,
         weather_series_tag=weather_series_tag,
+        candidate_selection_mode=candidate_selection_mode,
+        candidate_selection_pool_multiplier=candidate_selection_pool_multiplier,
     )
 

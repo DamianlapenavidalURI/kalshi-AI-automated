@@ -26,6 +26,10 @@ _SPACE = re.compile(r"\s+")
 _DATE_YYYY_MM_DD = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 _CITY_STATE = re.compile(r"\b([A-Za-z][A-Za-z .'-]{1,40}),\s*([A-Z]{2})\b")
 _STATE_ONLY = re.compile(r"\b([A-Z]{2})\b")
+_CITY_IN_TEXT = re.compile(
+    r"\bin\s+([A-Za-z][A-Za-z .'-]{1,40}?)(?:\s+(?:today|tomorrow|on|by|before|after|be|will)\b|[?]|$)",
+    re.I,
+)
 _AIRPORT_HINTS: dict[str, tuple[str, str]] = {
     "SFO": ("San Francisco, CA", "CA"),
     "NYC": ("New York, NY", "NY"),
@@ -40,6 +44,31 @@ _AIRPORT_HINTS: dict[str, tuple[str, str]] = {
     "BOS": ("Boston, MA", "MA"),
     "SEA": ("Seattle, WA", "WA"),
     "LAX": ("Los Angeles, CA", "CA"),
+    "MIN": ("Minneapolis, MN", "MN"),
+    "DAL": ("Dallas, TX", "TX"),
+    "LV": ("Las Vegas, NV", "NV"),
+    "SATX": ("San Antonio, TX", "TX"),
+    "PHX": ("Phoenix, AZ", "AZ"),
+}
+_CITY_TO_STATE: dict[str, str] = {
+    "atlanta": "GA",
+    "austin": "TX",
+    "boston": "MA",
+    "chicago": "IL",
+    "dallas": "TX",
+    "denver": "CO",
+    "houston": "TX",
+    "las vegas": "NV",
+    "los angeles": "CA",
+    "miami": "FL",
+    "minneapolis": "MN",
+    "new orleans": "LA",
+    "new york": "NY",
+    "philadelphia": "PA",
+    "phoenix": "AZ",
+    "san antonio": "TX",
+    "san francisco": "CA",
+    "seattle": "WA",
 }
 _SOURCE_WEIGHTS = {
     "open_meteo_geocode": 1.0,
@@ -52,6 +81,7 @@ _SOURCE_WEIGHTS = {
 }
 _THRESHOLD_PAT = re.compile(r"\b(?:above|over|exceed|greater than|below|under|less than)\s+(-?\d+(?:\.\d+)?)")
 _ANY_NUMBER_PAT = re.compile(r"(-?\d+(?:\.\d+)?)")
+_US_COUNTRY_KEYS = {"US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA"}
 
 
 def _clean_entity(s: str) -> str:
@@ -177,6 +207,8 @@ def _ticker_location_hints(*, market_ticker: str, event_ticker: str) -> tuple[st
     candidates: list[str] = []
     for stem in stems:
         alpha = re.sub(r"[^A-Z]", "", stem)
+        if len(alpha) >= 2:
+            candidates.append(alpha[-2:])
         if len(alpha) >= 3:
             candidates.append(alpha[-3:])
         if len(alpha) >= 4:
@@ -202,6 +234,26 @@ def _location_guess(
         city = cm.group(1).strip()
         state = cm.group(2).strip()
         return f"{city}, {state}", state, [f"{city}, {state}"]
+    city_in = _CITY_IN_TEXT.search(joined)
+    if city_in:
+        city = _clean_entity(city_in.group(1))
+        state_guess = _CITY_TO_STATE.get(city.lower())
+        hint_city = f"{city}, {state_guess}" if state_guess else city
+        hint_city_by_ticker, hint_state_by_ticker, hint_queries = _ticker_location_hints(
+            market_ticker=market_ticker, event_ticker=event_ticker
+        )
+        # Short city abbreviations like "LA" are ambiguous; prefer ticker-based city/state hints.
+        if not state_guess and hint_state_by_ticker:
+            state_guess = hint_state_by_ticker
+            if hint_city_by_ticker:
+                hint_city = hint_city_by_ticker
+            else:
+                hint_city = f"{city}, {state_guess}"
+        hints = [hint_city, city]
+        if hint_city_by_ticker:
+            hints.append(hint_city_by_ticker)
+        hints.extend(hint_queries)
+        return hint_city, state_guess, [h for h in dict.fromkeys(hints) if h]
     sm = _STATE_ONLY.search(joined)
     if sm:
         state = sm.group(1).strip()
@@ -269,8 +321,14 @@ def _open_meteo_history_brief(*, lat: float, lon: float, event_day: str | None, 
     return history_brief(lat=lat, lon=lon, event_day=event_day, timeout_s=timeout_s)
 
 
-def _nws_alerts_brief(*, state_code: str | None, timeout_s: float = 8.0) -> dict[str, Any]:
-    return alerts_brief(state_code=state_code, timeout_s=timeout_s)
+def _nws_alerts_brief(
+    *,
+    state_code: str | None,
+    lat: float | None = None,
+    lon: float | None = None,
+    timeout_s: float = 8.0,
+) -> dict[str, Any]:
+    return alerts_brief(state_code=state_code, lat=lat, lon=lon, timeout_s=timeout_s)
 
 
 def _duckduckgo_search(query: str, timeout_s: float = 8.0) -> dict[str, Any]:
@@ -357,11 +415,21 @@ def _weather_core(
         geocode_status["query"] = geocode_query
         if bool(geocode.get("ok")):
             break
+    geocode_country = str(geocode.get("country") or "").strip().upper()
+    geocode_country_code = str(geocode.get("country_code") or "").strip().upper()
+    nws_eligible = bool(geocode.get("ok")) and (
+        geocode_country in _US_COUNTRY_KEYS or geocode_country_code in _US_COUNTRY_KEYS
+    )
+
     if bool(geocode.get("ok")):
-        nws, nws_status = _timed_source(
-            "nws_forecast",
-            lambda: _nws_brief(lat=float(geocode["latitude"]), lon=float(geocode["longitude"]), timeout_s=timeout_s),
-        )
+        if nws_eligible:
+            nws, nws_status = _timed_source(
+                "nws_forecast",
+                lambda: _nws_brief(lat=float(geocode["latitude"]), lon=float(geocode["longitude"]), timeout_s=timeout_s),
+            )
+        else:
+            nws = {"ok": True, "skipped": True, "reason": "nws_outside_us"}
+            nws_status = {"source": "nws_forecast", "ok": True, "skipped": True, "reason": "nws_outside_us"}
         history, history_status = _timed_source(
             "open_meteo_history",
             lambda: _open_meteo_history_brief(
@@ -378,10 +446,21 @@ def _weather_core(
             "error": "geocode_required",
         }, {"source": "open_meteo_history", "ok": False}
 
-    alerts, alerts_status = _timed_source(
-        "nws_alerts",
-        lambda: _nws_alerts_brief(state_code=state_code, timeout_s=timeout_s),
-    )
+    geocode_lat = _f(geocode.get("latitude")) if isinstance(geocode, dict) else None
+    geocode_lon = _f(geocode.get("longitude")) if isinstance(geocode, dict) else None
+    if nws_eligible:
+        alerts, alerts_status = _timed_source(
+            "nws_alerts",
+            lambda: _nws_alerts_brief(
+                state_code=state_code,
+                lat=geocode_lat,
+                lon=geocode_lon,
+                timeout_s=timeout_s,
+            ),
+        )
+    else:
+        alerts = {"ok": True, "skipped": True, "reason": "nws_outside_us", "active_alert_count": 0}
+        alerts_status = {"source": "nws_alerts", "ok": True, "skipped": True, "reason": "nws_outside_us"}
     entities = extract_entities(event_title=event_title, market_title=market_title, max_entities=4)
     news_results = _entity_news(entities, timeout_s=timeout_s)
     return {

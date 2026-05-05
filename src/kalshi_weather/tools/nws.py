@@ -49,18 +49,41 @@ def forecast_brief(*, lat: float, lon: float, timeout_s: float = 8.0) -> dict[st
     return cached_loader(key=f"nws_forecast::{lat:.4f}:{lon:.4f}", ttl_s=900, loader=_load)
 
 
-def alerts_brief(*, state_code: str | None, timeout_s: float = 8.0) -> dict[str, Any]:
-    if not state_code:
-        return {"ok": False, "error": "state_code_unavailable"}
+def alerts_brief(
+    *,
+    state_code: str | None,
+    lat: float | None = None,
+    lon: float | None = None,
+    timeout_s: float = 8.0,
+) -> dict[str, Any]:
+    state = (state_code or "").strip().upper()
+    if not state and (lat is None or lon is None):
+        # Treat missing location scope as a neutral skip rather than hard failure.
+        return {
+            "ok": True,
+            "skipped": True,
+            "scope": "none",
+            "active_alert_count": 0,
+            "reason": "alerts_scope_unavailable",
+        }
 
     def _load() -> dict[str, Any]:
+        params: dict[str, Any]
+        scope: str
+        if state:
+            params = {"area": state}
+            scope = f"area:{state}"
+        else:
+            params = {"point": f"{float(lat):.4f},{float(lon):.4f}"}
+            scope = f"point:{float(lat):.4f},{float(lon):.4f}"
         alert_doc = http_get_json(
             "https://api.weather.gov/alerts/active",
-            params={"area": state_code.upper()},
+            params=params,
             timeout_s=timeout_s,
         )
         features = alert_doc.get("features")
         count = len(features) if isinstance(features, list) else 0
-        return {"ok": True, "state": state_code.upper(), "active_alert_count": count}
+        return {"ok": True, "state": state or None, "scope": scope, "active_alert_count": count}
 
-    return cached_loader(key=f"nws_alerts::{state_code.upper()}", ttl_s=300, loader=_load)
+    cache_key = f"nws_alerts::{state}" if state else f"nws_alerts::point:{float(lat):.4f},{float(lon):.4f}"
+    return cached_loader(key=cache_key, ttl_s=300, loader=_load)

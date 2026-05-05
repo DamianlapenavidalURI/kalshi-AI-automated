@@ -27,6 +27,7 @@ def geocode_open_meteo(query: str, *, timeout_s: float = 8.0) -> dict[str, Any]:
             "name": row.get("name"),
             "admin1": row.get("admin1"),
             "country": row.get("country"),
+            "country_code": row.get("country_code"),
             "latitude": float(lat),
             "longitude": float(lon),
         }
@@ -35,13 +36,16 @@ def geocode_open_meteo(query: str, *, timeout_s: float = 8.0) -> dict[str, Any]:
 
 
 def history_brief(*, lat: float, lon: float, event_day: str | None, timeout_s: float = 8.0) -> dict[str, Any]:
+    latest_available_day = datetime.now(timezone.utc).date() - timedelta(days=1)
     if event_day:
         try:
             end = datetime.fromisoformat(event_day).date() - timedelta(days=1)
         except ValueError:
-            end = datetime.now(timezone.utc).date() - timedelta(days=1)
+            end = latest_available_day
     else:
-        end = datetime.now(timezone.utc).date() - timedelta(days=1)
+        end = latest_available_day
+    if end > latest_available_day:
+        end = latest_available_day
     start = end - timedelta(days=6)
 
     def _load() -> dict[str, Any]:

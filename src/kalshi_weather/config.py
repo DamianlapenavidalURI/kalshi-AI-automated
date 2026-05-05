@@ -41,6 +41,8 @@ class Settings:
     unified_repeat_thesis_cooldown_minutes: int
     unified_final_orchestrator_temperature: float
     unified_candidate_scan_multiplier: int
+    unified_candidate_selection_mode: str
+    unified_candidate_selection_pool_multiplier: int
     unified_scout_override_priority: float
     unified_weather_series_tag: str | None
     unified_category_scope: str
@@ -130,6 +132,14 @@ def get_settings(*, load_dotenv_file: bool = True) -> Settings:
             f"UNIFIED_AUTONOMY_PROFILE must be one of safe|balanced|high. Got: {autonomy_profile_raw!r}"
         )
     autonomy_profile = cast(Literal["safe", "balanced", "high"], autonomy_profile_raw)
+    candidate_selection_mode_raw = (
+        (_optional_str("UNIFIED_CANDIDATE_SELECTION_MODE") or "ranked").strip().lower()
+    )
+    if candidate_selection_mode_raw not in {"ranked", "random", "random_all"}:
+        raise ValueError(
+            "UNIFIED_CANDIDATE_SELECTION_MODE must be one of ranked|random|random_all. "
+            f"Got: {candidate_selection_mode_raw!r}"
+        )
     openai_model_env = _optional_str("OPENAI_MODEL")
     openai_model_default = openai_model_env or "gpt-4o-mini"
     openai_model_scout = _optional_str("OPENAI_MODEL_SCOUT") or openai_model_default
@@ -181,6 +191,11 @@ def get_settings(*, load_dotenv_file: bool = True) -> Settings:
             _optional_str("UNIFIED_FINAL_ORCHESTRATOR_TEMPERATURE") or "0.35"
         ),
         unified_candidate_scan_multiplier=max(1, int(os.getenv("UNIFIED_CANDIDATE_SCAN_MULTIPLIER", "4"))),
+        unified_candidate_selection_mode=candidate_selection_mode_raw,
+        unified_candidate_selection_pool_multiplier=max(
+            1,
+            int(_optional_str("UNIFIED_CANDIDATE_SELECTION_POOL_MULTIPLIER") or "3"),
+        ),
         unified_scout_override_priority=float(_optional_str("UNIFIED_SCOUT_OVERRIDE_PRIORITY") or "70"),
         unified_weather_series_tag=_normalized_optional_tag("UNIFIED_WEATHER_SERIES_TAG"),
         unified_category_scope=_optional_str("UNIFIED_CATEGORY_SCOPE") or "weather_only",

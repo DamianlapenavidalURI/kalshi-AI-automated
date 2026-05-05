@@ -83,6 +83,21 @@ def main() -> None:
                    default=settings.unified_final_orchestrator_temperature)
     p.add_argument("--candidate-scan-multiplier", type=int,
                    default=settings.unified_candidate_scan_multiplier)
+    p.add_argument(
+        "--candidate-selection-mode",
+        choices=("ranked", "random", "random_all"),
+        default=settings.unified_candidate_selection_mode,
+        help=(
+            "How to pick final candidate slice: ranked, random from top pool, "
+            "or random_all across all eligible candidates."
+        ),
+    )
+    p.add_argument(
+        "--candidate-selection-pool-multiplier",
+        type=int,
+        default=settings.unified_candidate_selection_pool_multiplier,
+        help="When mode=random, sample from top(limit * multiplier) before taking limit.",
+    )
     p.add_argument("--scout-override-priority", type=float,
                    default=settings.unified_scout_override_priority)
     p.add_argument(
@@ -146,6 +161,8 @@ def main() -> None:
         repeat_thesis_cooldown_minutes=max(1, int(settings.unified_repeat_thesis_cooldown_minutes)),
         final_orchestrator_temperature=max(0.0, min(1.0, float(args.final_orchestrator_temperature))),
         candidate_scan_multiplier=max(1, int(args.candidate_scan_multiplier)),
+        candidate_selection_mode=str(args.candidate_selection_mode),
+        candidate_selection_pool_multiplier=max(1, int(args.candidate_selection_pool_multiplier)),
         scout_override_priority_0_100=float(args.scout_override_priority),
         data_fetch_workers=max(1, int(args.data_fetch_workers)),
         weather_series_tag=(str(args.weather_series_tag).strip() or None),
@@ -182,6 +199,11 @@ def main() -> None:
         if not picks:
             return "none"
         return ", ".join(str(r.get("ticker") or "?") for r in picks)
+
+    def _fmt_mmss(seconds: float) -> str:
+        total = max(0, int(round(seconds)))
+        mins, secs = divmod(total, 60)
+        return f"{mins:02d}:{secs:02d}"
 
     def run_once() -> None:
         cycle_started = time.time()
@@ -235,8 +257,8 @@ def main() -> None:
                 key="intent",
             ),
         )
-        logging.info("[CYCLE] completed in %.2fs",
-                     max(0.0, time.time() - cycle_started))
+        elapsed = max(0.0, time.time() - cycle_started)
+        logging.info("[CYCLE] completed in %s", _fmt_mmss(elapsed))
         if args.print_agent_outputs:
             print(json.dumps(out, ensure_ascii=False, indent=2))
 
